@@ -286,7 +286,12 @@ def process_submissions(submissions: List[Dict], *, dry_run: Optional[bool]) -> 
 
 
 def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
-    """Extract the email address and consent checkbox selections from a submission."""
+    """Extract the email address and consent checkbox selections from a submission.
+
+    Only captures values that are exactly "Checked" or "Not Checked". If a
+    checkbox property appears multiple times in a single submission, the final
+    occurrence wins.
+    """
 
     values = submission.get("values", [])
     email: Optional[str] = None
@@ -296,11 +301,16 @@ def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
         name = item.get("name")
         value = item.get("value")
 
-        if name == "email" and isinstance(value, str):
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+
+        if name == "email":
             email = value.strip() or None
-        elif name in CHECKBOX_PROPERTIES and isinstance(value, str):
+            continue
+
+        if name in CHECKBOX_PROPERTIES:
             trimmed = value.strip()
-            if trimmed:
+            if trimmed in ("Checked", "Not Checked"):
                 consent_states[name] = trimmed
 
     return email, consent_states
