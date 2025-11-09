@@ -10,8 +10,8 @@ host on [Render](https://render.com/) or any container-friendly platform.
 ## Features
 
 - **On-demand execution** – Runs only when the `/run` webhook is invoked; no Zapier dependencies.
-- **Form submission recovery** – Fetches up to 500 submissions from HubSpot and re-applies the consent values to the matching
-  contacts.
+- **Form submission recovery** – Fetches submissions from HubSpot in configurable batches (default 500) and re-applies the
+  consent values to the matching contacts.
 - **Contact safety** – Updates only the `portal_terms_accepted` and `marketing_opt_in_vrm_properties` properties when a matching
   email is found.
 - **Structured responses** – Returns a JSON summary detailing how many submissions were processed, updated, skipped, or produced
@@ -58,12 +58,15 @@ You can place these values in a `.env` file when running locally (the app uses `
    uvicorn app:app --host 0.0.0.0 --port 8000
    ```
 
-4. Trigger a run by sending a POST request to the `/run` endpoint (no body required, although you can supply an optional `limit`):
+4. Trigger a run by sending a POST request to the `/run` endpoint. The body is optional, but you can override the batch size or
+   cap the total submissions processed if you need to throttle very large jobs:
 
    ```bash
    curl -X POST http://localhost:8000/run
-   # or override the limit
-   curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"limit": 200}'
+   # override the per-request batch size
+    curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"batch_size": 750}'
+   # or limit the total submissions processed
+   curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"max_submissions": 2000}'
    ```
 
 A successful request returns a payload similar to:
@@ -100,7 +103,9 @@ A successful request returns a payload similar to:
 
 ## How the Service Works
 
-1. **Fetch submissions** – Calls `GET /form-integrations/v1/submissions/forms/{formId}` with the provided limit (default 500).
+1. **Fetch submissions** – Calls `GET /form-integrations/v1/submissions/forms/{formId}` in batches (default 500 per request),
+   automatically paging through the results until the API reports no further data or the optional `max_submissions` threshold is
+   met.
 2. **Parse checkbox values** – Reads the `values` array from each submission and extracts:
    - `i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy` → `portal_terms_accepted`
    - `select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information` →
@@ -109,8 +114,9 @@ A successful request returns a payload similar to:
 4. **Update contact** – Patches the contact with the parsed consent values. If the contact is missing or an error occurs, the
    service records the skipped/error count but continues processing the remaining submissions.
 
-All processing happens synchronously within the request so you immediately receive a status summary. For large batches you can
-lower the `limit` or trigger multiple runs to stay within HubSpot rate limits.
+All processing happens synchronously within the request so you immediately receive a status summary. For large batches (for
+example 13,000+ submissions) the service paginates through the HubSpot results automatically. You can reduce the `batch_size` or
+set `max_submissions` to break the work into smaller chunks if you need to respect HubSpot rate limits or long-running timeouts.
 
 ---
 

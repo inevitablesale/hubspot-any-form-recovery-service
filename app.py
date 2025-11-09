@@ -1,10 +1,10 @@
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, Optional, Set, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -36,7 +36,20 @@ def hubspot_headers() -> Dict[str, str]:
 
 
 class RunRequest(BaseModel):
-    limit: int = Field(500, gt=0, le=1000, description="Maximum number of submissions to fetch.")
+    model_config = ConfigDict(populate_by_name=True)
+
+    batch_size: int = Field(
+        500,
+        alias="limit",
+        gt=0,
+        le=1000,
+        description="Number of submissions to fetch per HubSpot API request.",
+    )
+    max_submissions: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Stop after processing this many submissions (useful for throttling very large runs).",
+    )
 
 
 class RunResponse(BaseModel):
@@ -49,7 +62,9 @@ class RunResponse(BaseModel):
 @app.post("/run", response_model=RunResponse)
 def run_sync(payload: RunRequest) -> RunResponse:
     try:
-        stats = process_submissions(limit=payload.limit)
+        stats = process_submissions(
+            batch_size=payload.batch_size, max_submissions=payload.max_submissions
+        )
     except RuntimeError as exc:
         logger.exception("Configuration error while running recovery job")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -63,11 +78,11 @@ def run_sync(payload: RunRequest) -> RunResponse:
     return RunResponse(**stats)
 
 
-def process_submissions(limit: int) -> Dict[str, int]:
-    submissions = fetch_form_submissions(limit=limit)
-    stats = {"processed": len(submissions), "updated": 0, "skipped": 0, "errors": 0}
+def process_submissions(batch_size: int, max_submissions: Optional[int] = None) -> Dict[str, int]:
+    stats = {"processed": 0, "updated": 0, "skipped": 0, "errors": 0}
 
-    for submission in submissions:
+    for submission in iter_form_submissions(batch_size=batch_size, max_submissions=max_submissions):
+        stats["processed"] += 1
         try:
             email, checkbox_values = parse_submission(submission)
         except ValueError as exc:
@@ -104,15 +119,58 @@ def process_submissions(limit: int) -> Dict[str, int]:
     return stats
 
 
-def fetch_form_submissions(limit: int) -> List[Dict]:
+def iter_form_submissions(
+    batch_size: int, max_submissions: Optional[int] = None
+) -> Iterator[Dict]:
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{HUBSPOT_FORM_ID}"
-    response = requests.get(url, headers=hubspot_headers(), params={"limit": limit}, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    results = payload.get("results", [])
+    seen_offsets: Set[str] = set()
+    fetched = 0
+    offset: Optional[str] = None
 
-    logger.info("Fetched %s submissions", len(results))
-    return results
+    while True:
+        params: Dict[str, object] = {"limit": batch_size}
+        if offset is not None:
+            params["offset"] = offset
+
+        response = requests.get(url, headers=hubspot_headers(), params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        results = payload.get("results", [])
+
+        if not results:
+            logger.info("Fetched 0 submissions at offset %s", offset)
+        else:
+            logger.info("Fetched %s submissions (total so far %s)", len(results), fetched + len(results))
+
+        for submission in results:
+            yield submission
+            fetched += 1
+            if max_submissions is not None and fetched >= max_submissions:
+                logger.info("Reached max_submissions=%s; stopping early", max_submissions)
+                return
+
+        next_offset = (
+            payload.get("continuationOffset")
+            or payload.get("offset")
+            or payload.get("paging", {}).get("next", {}).get("after")
+        )
+
+        has_more = payload.get("hasMore")
+
+        if not next_offset:
+            if has_more:
+                logger.warning("HubSpot indicated more submissions but no offset was returned; stopping to avoid loop")
+            break
+
+        if next_offset in seen_offsets:
+            logger.warning("Encountered repeated offset %s; stopping to avoid infinite loop", next_offset)
+            break
+
+        seen_offsets.add(next_offset)
+        offset = str(next_offset)
+
+        if not results and not has_more:
+            break
 
 
 def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
@@ -168,5 +226,5 @@ def update_contact(contact_id: str, consent_states: Dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    stats = process_submissions(limit=500)
+    stats = process_submissions(batch_size=500)
     logger.info("Run finished: %s", stats)
