@@ -13,7 +13,7 @@ It is designed for read-only auditing or consent verification, and does not modi
   - HubSpot Submission ID
   - Email
   - “Portal Terms Accepted”
-  - “Marketing Opt-In (VRM Properties)”
+  - “Marketing Opt-In (----)”
 - 🛑 **Kill Switch** – Visit `/kill` at any time to gracefully stop a long-running job.
 - 🧱 **Read-Only Mode** – Does not update, patch, or sync data back to HubSpot. Safe to run in production environments.
 - 🧾 **Structured Logging** – Streams readable logs to stdout and rotates detailed logs into `recovery.log`.
@@ -24,14 +24,14 @@ It is designed for read-only auditing or consent verification, and does not modi
 
 - Python 3.10+
 - HubSpot private app token with permission to read form submissions
-- HubSpot form ID `4750ad3c-bf26-4378-80f6-e7937821533f`
+- HubSpot form ID `----`
 
 ## Environment Variables
 
 | Variable | Description |
 | --- | --- |
 | `HUBSPOT_PRIVATE_APP_TOKEN` | Required. HubSpot private app token used for API requests. |
-| `HUBSPOT_FORM_ID` | Optional. Defaults to `4750ad3c-bf26-4378-80f6-e7937821533f`. |
+| `HUBSPOT_FORM_ID` | Optional. Defaults to `----`. |
 | `HUBSPOT_BASE_URL` | Optional. HubSpot API base URL (default `https://api.hubapi.com`). |
 | `HUBSPOT_CHECKBOX_PROPERTIES` | Optional. Comma-separated list of consent checkbox properties (defaults to VRM Properties fields). |
 | `DRY_RUN` | Optional. Defaults to `true`. Read-only behavior enforced regardless. |
@@ -92,8 +92,8 @@ The app automatically loads them using `python-dotenv`.
 
 ```
 2025-11-09 16:03:11,974 | INFO | Total submissions fetched: 17773
-2025-11-09 16:03:11,975 | INFO | [0001] Submission ID: 6354a0cd-3b21-409d-ad7a-f865854697f3 | Email: andrewjgordin1985@gmail.com | Portal Terms: Checked | Marketing Opt-In: Checked
-2025-11-09 16:03:11,976 | INFO | [0002] Submission ID: 4fd8a3eb-f97d-4b2a-a626-5d89706f66fa | Email: andrewjgordin1985@gmail.com | Portal Terms: Checked | Marketing Opt-In: Checked
+2025-11-09 16:03:11,975 | INFO | [0001] Submission ID: ### | Email: ---- | Portal Terms: Checked | Marketing Opt-In: Checked
+2025-11-09 16:03:11,976 | INFO | [0002] Submission ID: ### | Email: ----| Portal Terms: Checked | Marketing Opt-In: Checked
 ```
 
 ## Deploying to Render
@@ -134,7 +134,7 @@ The app automatically loads them using `python-dotenv`.
    - Submission ID
    - Email
    - Portal Terms Accepted
-   - Marketing Opt-In (VRM Properties)
+   - Marketing Opt-In (---)
 4. **Graceful Shutdown** – If `/kill` is called during execution, the service halts safely and logs a warning.
 
 ## Extending the Service
@@ -158,8 +158,5 @@ app.py             # FastAPI app entry point and recovery logic
 requirements.txt   # Python dependencies
 README.md          # This documentation
 ```
-
-## ✅ Summary
-
 This edition of the HubSpot Registration Form Recovery Service is a safe, read-only tool for auditing and verifying consent records.
 It logs submission IDs and consent preferences without modifying HubSpot data — perfect for compliance verification, troubleshooting, or data reconciliation.
