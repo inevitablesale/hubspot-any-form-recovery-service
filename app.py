@@ -1,7 +1,10 @@
-"""FastAPI service to recover and log HubSpot consent preferences (no updates)."""
+"""FastAPI service to recover and log HubSpot consent preferences (no updates, enhanced logging, kill switch)."""
 
 from __future__ import annotations
-import logging, os, time
+import json
+import logging
+import os
+import time
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
@@ -65,6 +68,18 @@ logger.info("Configured checkbox fields: %s", ", ".join(CHECKBOX_PROPERTIES))
 FORM_PAGE_SIZE = 50  # v1 max limit
 FETCH_DELAY = 0.2
 
+# --- Kill flag ---
+RUNNING = True
+
+
+@app.get("/kill")
+def kill_job():
+    """Stops a currently running recovery process."""
+    global RUNNING
+    RUNNING = False
+    logger.warning("Kill signal received — active process will stop shortly.")
+    return {"status": "terminating", "message": "Active recovery job will stop gracefully."}
+
 
 # --- Helpers ---
 def hubspot_headers(include_content_type: bool = True) -> Dict[str, str]:
@@ -96,13 +111,23 @@ class RunSummary(BaseModel):
 
 # --- Main Recovery Logic ---
 def execute_recovery(form_id: str, dry_run: bool) -> RunSummary:
+    global RUNNING
+    RUNNING = True  # reset kill flag each run
+
     if not form_id:
         raise HTTPException(status_code=500, detail="HUBSPOT_FORM_ID env variable required")
 
     logger.info("Running recovery for form: %s | dry_run=%s", form_id, dry_run)
+    start_time = time.time()
 
     submissions = fetch_all_submissions(form_id)
     stats = process_submissions(submissions)
+
+    elapsed = time.time() - start_time
+    logger.info("=" * 80)
+    logger.info("✅ Run finished | Total processed: %s | Runtime: %.1f sec", stats["processed"], elapsed)
+    logger.info("=" * 80)
+
     return RunSummary(dry_run=dry_run, **stats)
 
 
@@ -126,13 +151,14 @@ def run_recovery_get(
 
 # --- Fetch submissions (v1 version) ---
 def fetch_all_submissions(form_id: str) -> List[Dict]:
+    global RUNNING
     submissions: List[Dict] = []
     after: Optional[str] = None
 
     logger.info("Fetching submissions from HubSpot API (/form-integrations/v1)...")
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
 
-    while True:
+    while RUNNING:
         params: Dict[str, object] = {"limit": FORM_PAGE_SIZE}
         if after:
             params["after"] = after
@@ -152,27 +178,54 @@ def fetch_all_submissions(form_id: str) -> List[Dict]:
         if not after:
             break
 
-    logger.info("Total submissions fetched: %s", len(submissions))
+    if not RUNNING:
+        logger.warning("🟥 Fetch interrupted by kill signal. Returning partial data (%s submissions).", len(submissions))
+    else:
+        logger.info("Total submissions fetched: %s", len(submissions))
+
     return submissions
 
 
-# --- Parse & Log Consent Values ---
+# --- Parse & Log Consent Values (enhanced per-record output) ---
 def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
+    global RUNNING
     stats = {"processed": 0, "parsed": 0, "skipped": 0, "errors": 0}
 
     for i, submission in enumerate(submissions, start=1):
+        if not RUNNING:
+            logger.warning("🟥 Run stopped manually after %s submissions processed.", stats["processed"])
+            break
+
         stats["processed"] += 1
         try:
             email, checkboxes = parse_submission(submission)
-            if not email or not checkboxes:
+            if not email:
                 stats["skipped"] += 1
                 continue
 
+            # Extract specific fields for visibility
+            portal_terms = checkboxes.get(
+                "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "N/A"
+            )
+            marketing_opt_in = checkboxes.get(
+                "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information",
+                "N/A",
+            )
+
+            logger.info(
+                "[%04d] Email: %-40s | Portal Terms Accepted: %-10s | Marketing Opt-In (VRM Properties): %-10s",
+                i, email, portal_terms, marketing_opt_in
+            )
+
             stats["parsed"] += 1
-            logger.info("[%s] %s → %s", i, email, json.dumps(checkboxes))
         except Exception as e:
             stats["errors"] += 1
             logger.error("Error processing submission %s: %s", i, e)
+
+    if RUNNING:
+        logger.info("✅ Completed full run (%s submissions).", stats["processed"])
+    else:
+        logger.warning("🟥 Run terminated early by user.")
 
     return stats
 
@@ -195,8 +248,3 @@ def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": time.time(), "dry_run": DRY_RUN}
-
-
-if __name__ == "__main__":
-    summary = execute_recovery(DEFAULT_FORM_ID, dry_run=DRY_RUN)
-    logger.info("Run finished: %s", summary.model_dump())
