@@ -1,4 +1,4 @@
-"""FastAPI service to recover and log HubSpot consent preferences (no updates, enhanced logging, kill switch)."""
+"""FastAPI service to recover and log HubSpot consent preferences (no updates, enhanced logging, kill switch, submission ID)."""
 
 from __future__ import annotations
 import json
@@ -199,11 +199,17 @@ def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
         stats["processed"] += 1
         try:
             email, checkboxes = parse_submission(submission)
+            submission_id = (
+                submission.get("conversionId")
+                or submission.get("submissionGuid")
+                or submission.get("id")
+                or "N/A"
+            )
+
             if not email:
                 stats["skipped"] += 1
                 continue
 
-            # Extract specific fields for visibility
             portal_terms = checkboxes.get(
                 "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "N/A"
             )
@@ -213,8 +219,8 @@ def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
             )
 
             logger.info(
-                "[%04d] Email: %-40s | Portal Terms Accepted: %-10s | Marketing Opt-In (VRM Properties): %-10s",
-                i, email, portal_terms, marketing_opt_in
+                "[%04d] Submission ID: %s | Email: %-40s | Portal Terms: %-10s | Marketing Opt-In: %-10s",
+                i, submission_id, email, portal_terms, marketing_opt_in
             )
 
             stats["parsed"] += 1
