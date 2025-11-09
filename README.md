@@ -52,7 +52,7 @@ The app automatically loads them using `python-dotenv`.
 
    ```bash
    export HUBSPOT_PRIVATE_APP_TOKEN="your-private-app-token"
-   export HUBSPOT_FORM_ID="4750ad3c-bf26-4378-80f6-e7937821533f"
+   export HUBSPOT_FORM_ID="---"
    export DRY_RUN="true"
    ```
 
@@ -91,7 +91,7 @@ The app automatically loads them using `python-dotenv`.
 ## Sample Output (Log)
 
 ```
-2025-11-09 16:03:11,974 | INFO | Total submissions fetched: 17773
+2025-11-09 16:03:11,974 | INFO | Total submissions fetched: ###
 2025-11-09 16:03:11,975 | INFO | [0001] Submission ID: ### | Email: ---- | Portal Terms: Checked | Marketing Opt-In: Checked
 2025-11-09 16:03:11,976 | INFO | [0002] Submission ID: ### | Email: ----| Portal Terms: Checked | Marketing Opt-In: Checked
 ```
