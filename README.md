@@ -1,217 +1,158 @@
-# LearnUpon User Fetcher
+# HubSpot Registration Form Recovery Automation
 
-A Python application that pulls all users from LearnUpon using pagination, classifies them by status (Active, Deactivated, or Pending Invite), and returns the combined list. The application can be run manually or scheduled to run daily.
+This guide walks through building a Zapier automation that recovers consent preferences from HubSpot form submissions and syncs them to the corresponding contact records. The automation runs every weekday morning, fetches the most recent submissions from the `#registerForm`, parses the consent checkboxes, and updates the matching HubSpot contacts.
 
-## Features
+---
 
-- **Pagination Support**: Automatically fetches all users across multiple pages
-- **User Classification**: Classifies users as Active, Deactivated, or Pending Invite based on:
-  - Custom data field `active_yes_or_no`
-  - Sign-in count and last sign-in date
-- **Error Handling**: Robust error handling with configurable retry logic
-- **Logging**: Comprehensive logging to both file and console
-- **Scheduling**: Built-in daily scheduling capability
-- **JSON Output**: Results saved in structured JSON format with summary statistics
+## Prerequisites
 
-## Installation
+- A Zapier account with access to the **Schedule by Zapier**, **Looping by Zapier**, **Formatter by Zapier**, and **Code by Zapier** apps
+- HubSpot account credentials with API access and permission to read form submissions and update contacts
+- The HubSpot form ID `4750ad3c-bf26-4378-80f6-e7937821533f` (the `#registerForm`)
 
-1. **Clone or download the files** to your local machine
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+---
 
-## Configuration
+## High-Level Flow
 
-### Environment Variables
+1. Schedule the Zap to run every weekday at 9:00 AM.
+2. Retrieve up to 500 submissions for the registration form via the HubSpot Forms API.
+3. Loop over each submission returned.
+4. Extract the submitter’s email address.
+5. Parse the checkbox fields to determine consent values.
+6. Locate the HubSpot contact that matches the extracted email.
+7. Update the contact’s consent properties with the parsed values.
 
-Create a `.env` file (or set environment variables) with the following:
+The Zap never creates new contacts; it only updates consent fields on existing records.
 
-```bash
-# Required
-LEARNUPON_USERNAME=your_username_here
-LEARNUPON_PASSWORD=your_password_here
-LEARNUPON_SUBDOMAIN=vrmuniversity
+---
 
-# Optional
-LEARNUPON_MAX_PAGES=1000
-LEARNUPON_MAX_CONSECUTIVE_ERRORS=3
-LEARNUPON_REQUEST_TIMEOUT=30
-LEARNUPON_SCHEDULE_TIME=09:00
-LEARNUPON_OUTPUT_DIR=.
-LEARNUPON_LOG_LEVEL=INFO
-```
+## Step-by-Step Build Instructions
 
-### Configuration Options
+### 1. Schedule Trigger
+- **App**: Schedule by Zapier
+- **Event**: *Every Day*
+- **Configuration**:
+  - Time: `9:00 AM`
+  - Choose "*Weekdays*" so the Zap runs Monday–Friday only
 
-- `LEARNUPON_USERNAME`: Your LearnUpon API username (required)
-- `LEARNUPON_PASSWORD`: Your LearnUpon API password (required)
-- `LEARNUPON_SUBDOMAIN`: LearnUpon subdomain (default: vrmuniversity)
-- `LEARNUPON_MAX_PAGES`: Maximum pages to fetch (default: 1000)
-- `LEARNUPON_MAX_CONSECUTIVE_ERRORS`: Max consecutive errors before stopping (default: 3)
-- `LEARNUPON_REQUEST_TIMEOUT`: Request timeout in seconds (default: 30)
-- `LEARNUPON_SCHEDULE_TIME`: Time to run daily schedule (default: 09:00)
-- `LEARNUPON_OUTPUT_DIR`: Directory to save output files (default: current directory)
-- `LEARNUPON_LOG_LEVEL`: Logging level (default: INFO)
+Purpose: ensures the recovery process runs once per business day during working hours.
 
-## Usage
+### 2. Fetch Form Submissions
+- **App**: HubSpot API Request (Beta)
+- **Event**: *Custom Request*
+- **Configuration**:
+  - Method: `GET`
+  - URL: `/form-integrations/v1/submissions/forms/4750ad3c-bf26-4378-80f6-e7937821533f`
+  - Query String Parameters: `limit = 500`
 
-### Manual Run
+Purpose: retrieves up to 500 submissions for the registration form in a single run. The response body contains the `results` array used in later steps.
 
-Run the fetcher once:
+### 3. Loop Through Submissions
+- **App**: Looping by Zapier
+- **Event**: *Create Loop From Line Items*
+- **Configuration**:
+  - Loop Values: `{{HubSpot API Request → results}}`
+  - Max Iterations: `500`
 
-```bash
-python learnupon_user_fetcher.py
-```
+Purpose: processes each submission individually to keep contact lookups and updates targeted.
 
-### Scheduled Run
+### 4. Extract the Email Address
+- **App**: Formatter by Zapier
+- **Event**: *Text → Extract Email Address*
+- **Input**: `{{Loop → submission}}`
 
-Run with daily scheduling (runs at 9 AM by default):
+Purpose: isolates the email string from the submission payload so it can be used in the HubSpot contact search.
 
-```bash
-python learnupon_user_fetcher.py --schedule
-```
+### 5. Parse Checkbox Values (Python Code)
+- **App**: Code by Zapier
+- **Event**: *Run Python*
+- **Input**:
+  - Pass the entire loop item JSON (e.g., `submission`) as an input variable.
+- **Sample Code**:
 
-### Using the Scheduled Runner
+  ```python
+  import json
 
-For production environments, you can use the dedicated scheduled runner:
+  submission = json.loads(input_data["submission"])
 
-```bash
-python run_scheduled.py
-```
+  checkbox_fields = {
+      "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Portal Terms Accepted",
+      "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information": "Marketing Opt-In (VRM Properties)",
+  }
 
-This is useful for cron jobs or other scheduling systems.
+  output = {
+      "Portal Terms Accepted": "Not Checked",
+      "Marketing Opt-In (VRM Properties)": "Not Checked",
+  }
 
-## Output
+  for value in submission.get("values", []):
+      name = value.get("name")
+      if name in checkbox_fields:
+          label = checkbox_fields[name]
+          output[label] = "Checked" if value.get("value") == "Checked" else "Not Checked"
 
-The application generates:
+  return output
+  ```
 
-1. **JSON File**: `learnupon_users_YYYYMMDD_HHMMSS.json` containing:
-   - Timestamp of the run
-   - Total user count
-   - Summary statistics by status
-   - Complete user list with processed data
+Purpose: converts the checkbox data from the submission into clean "Checked" / "Not Checked" strings without hard-coded defaults beyond the two relevant fields.
 
-2. **Log File**: `learnupon_fetcher.log` with detailed execution logs
+### 6. Find the Contact by Email
+- **App**: HubSpot
+- **Event**: *Find Contact*
+- **Configuration**:
+  - Search Property: `email`
+  - Search Value: `{{Formatter → Email Address}}`
+  - Success on Miss: `False`
+  - Multiple Matches: `First`
 
-### Sample Output Structure
+Purpose: ensures the Zap only proceeds for existing contacts. If no match is found the loop iteration ends without attempting an update.
+
+### 7. Update Contact Consent Fields
+- **App**: HubSpot
+- **Event**: *Update Contact*
+- **Configuration**:
+  - Contact ID: `{{Find Contact → Record ID}}`
+  - Properties:
+    - `portal_terms_accepted`: `{{Code → Portal Terms Accepted}}`
+    - `marketing_opt_in_vrm_properties`: `{{Code → Marketing Opt-In (VRM Properties)}}`
+
+Purpose: writes the parsed checkbox states back to the contact record while leaving all other properties untouched.
+
+---
+
+## Safeguards and Best Practices
+
+- **No new contacts**: The Zap updates only if a matching contact exists, preventing duplicate records.
+- **Minimal scope updates**: Only the consent fields are updated to avoid overwriting other profile data.
+- **Daily batch window**: Capping the loop at 500 items respects HubSpot rate limits while covering the day’s submissions.
+- **Error visibility**: Failed API calls stop the Zap, making it clear when manual intervention is needed.
+
+---
+
+## Form Response Structure Reference
+
+HubSpot returns each submission in the following format:
 
 ```json
 {
-  "timestamp": "2024-01-15T09:00:00.000000",
-  "total_users": 150,
-  "summary": {
-    "Active": 120,
-    "Deactivated": 20,
-    "Pending Invite": 10,
-    "Total": 150
-  },
-  "users": [
-    {
-      "email": "user@example.com",
-      "first_name": "John",
-      "last_name": "Doe",
-      "learupon_user_id": "12345",
-      "learupon_account_status": "Active",
-      "sign_in_count": 15,
-      "last_sign_in_at": "2024-01-10T14:30:00Z",
-      "created_at": "2024-01-01T10:00:00Z",
-      "updated_at": "2024-01-15T08:45:00Z"
-    }
+  "values": [
+    {"name": "email", "value": "contact@example.com"},
+    {"name": "firstname", "value": "John"},
+    {"name": "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "value": "Checked"},
+    {"name": "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information", "value": "Not Checked"}
   ]
 }
 ```
 
-## User Classification Logic
+Use this structure to confirm the correct field names and values in the parsing step.
 
-Users are classified based on the following logic:
+---
 
-1. **Deactivated**: If `CustomData.active_yes_or_no` is "no"
-2. **Active**: If `CustomData.active_yes_or_no` is "yes"
-3. **Pending Invite**: If `sign_in_count` is 0 AND `last_sign_in_at` is null/empty
-4. **Active**: Default status if no specific indicators are present
+## Maintenance Tips
 
-## Error Handling
+- Periodically review submission volume to confirm the 500-item limit is sufficient.
+- Monitor HubSpot property API names in case they change during portal configuration updates.
+- Log Zap runs and review error notifications to catch issues quickly.
+- Test the Zap after any HubSpot form or property changes to ensure the parsing logic still aligns with the payload.
 
-The application includes robust error handling:
-
-- **Network Errors**: Automatic retry with configurable limits
-- **API Errors**: Detailed error logging with response codes
-- **Data Validation**: Handles malformed user data gracefully
-- **Consecutive Errors**: Stops after configurable consecutive failures
-
-## Logging
-
-Logs are written to both:
-- **Console**: Real-time progress updates
-- **File**: `learnupon_fetcher.log` for historical records
-
-Log levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
-
-## Scheduling
-
-### Built-in Scheduler
-
-The application includes a built-in scheduler that runs daily at the configured time:
-
-```bash
-python learnupon_user_fetcher.py --schedule
-```
-
-### External Scheduling
-
-For production environments, consider using:
-
-- **Cron** (Linux/macOS):
-  ```bash
-  0 9 * * * /path/to/python /path/to/run_scheduled.py
-  ```
-
-- **Task Scheduler** (Windows):
-  - Create a task to run `run_scheduled.py` daily at 9 AM
-
-- **Docker**: Use a container with cron or a scheduling service
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Authentication Errors**:
-   - Verify username and password
-   - Check subdomain configuration
-   - Ensure API access is enabled
-
-2. **Network Timeouts**:
-   - Increase `LEARNUPON_REQUEST_TIMEOUT`
-   - Check network connectivity
-   - Verify LearnUpon API status
-
-3. **No Users Found**:
-   - Check if pagination is working correctly
-   - Verify API endpoint URL
-   - Review logs for error messages
-
-### Debug Mode
-
-Enable debug logging:
-
-```bash
-export LEARNUPON_LOG_LEVEL=DEBUG
-python learnupon_user_fetcher.py
-```
-
-## API Compatibility
-
-This application is designed to work with LearnUpon's REST API v1. The exact API endpoints and response formats may vary by LearnUpon instance configuration.
-
-## Security Notes
-
-- Store credentials securely using environment variables
-- Never commit `.env` files to version control
-- Use appropriate file permissions for log files
-- Consider using API keys instead of passwords if available
-
-## License
-
-This project is provided as-is for educational and business purposes.
-# hubspot-registration-form-recovery
+This automation offers a reliable recovery mechanism to keep HubSpot consent preferences aligned with the latest form submissions.
