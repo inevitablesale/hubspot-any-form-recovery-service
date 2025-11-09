@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -16,8 +18,20 @@ from pydantic import BaseModel
 load_dotenv()
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+LOG_FILE = os.getenv("LOG_FILE", "recovery.log")
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
+
+logger = logging.getLogger("hubspot_form_recovery")
+logger.setLevel(logging.INFO)
+logger.handlers = []
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logger.addHandler(stream_handler)
+
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logger.addHandler(file_handler)
 
 
 app = FastAPI(title="HubSpot Form Recovery – Sequential Version")
@@ -27,10 +41,15 @@ HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
 HUBSPOT_FORM_ID = os.getenv("HUBSPOT_FORM_ID", "4750ad3c-bf26-4378-80f6-e7937821533f")
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
 
-CHECKBOX_PROPERTIES = (
-    "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy",
-    "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information",
-)
+CHECKBOX_PROPERTIES = [
+    prop.strip()
+    for prop in os.getenv(
+        "HUBSPOT_CHECKBOX_PROPERTIES",
+        "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy,"
+        "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information",
+    ).split(",")
+    if prop.strip()
+]
 
 FORM_PAGE_SIZE = 1000
 FETCH_DEFAULT_DELAY = 0.2
@@ -50,7 +69,12 @@ def hubspot_headers(include_content_type: bool = True) -> Dict[str, str]:
     return headers
 
 
+class RunRequest(BaseModel):
+    dry_run: bool = False
+
+
 class RunSummary(BaseModel):
+    dry_run: bool
     processed: int
     updated: int
     skipped: int
@@ -58,12 +82,16 @@ class RunSummary(BaseModel):
 
 
 @app.post("/run", response_model=RunSummary)
-def run_recovery() -> RunSummary:
+def run_recovery(request: Optional[RunRequest] = None) -> RunSummary:
     """Trigger the recovery job and return a JSON summary of the results."""
+
+    dry_run = bool(request.dry_run) if request else False
+    if dry_run:
+        logger.info("Running in DRY RUN mode — no HubSpot updates will be made.")
 
     try:
         submissions = fetch_all_submissions()
-        stats = process_submissions(submissions)
+        stats = process_submissions(submissions, dry_run=dry_run)
     except RuntimeError as exc:
         logger.exception("Configuration error while running recovery job")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -74,7 +102,7 @@ def run_recovery() -> RunSummary:
         logger.exception("Unexpected error while running recovery job")
         raise HTTPException(status_code=500, detail="Unexpected error") from exc
 
-    return RunSummary(**stats)
+    return RunSummary(dry_run=dry_run, **stats)
 
 
 def fetch_all_submissions() -> List[Dict]:
@@ -131,7 +159,7 @@ def fetch_all_submissions() -> List[Dict]:
     return submissions
 
 
-def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
+def process_submissions(submissions: List[Dict], *, dry_run: bool) -> Dict[str, int]:
     """Iterate over submissions sequentially and update contacts one by one."""
 
     stats = {"processed": 0, "updated": 0, "skipped": 0, "errors": 0}
@@ -145,41 +173,69 @@ def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
 
             if not email:
                 stats["skipped"] += 1
-                logger.warning("Skipping submission #%s: no email present", index)
+                log_json(
+                    "skip_no_email",
+                    submission_index=index,
+                    conversion_id=submission.get("conversionId"),
+                )
                 continue
 
             if not checkbox_values:
                 stats["skipped"] += 1
-                logger.info(
-                    "Skipping submission #%s for %s: no consent checkbox values returned",
-                    index,
-                    email,
+                log_json(
+                    "skip_no_checkboxes",
+                    submission_index=index,
+                    email=email,
                 )
                 continue
 
             contact_id = find_contact_by_email(email)
             if not contact_id:
                 stats["skipped"] += 1
-                logger.warning("Skipping submission #%s for %s: contact not found", index, email)
+                log_json(
+                    "skip_contact_not_found",
+                    submission_index=index,
+                    email=email,
+                )
+                continue
+
+            if dry_run:
+                stats["updated"] += 1
+                log_json(
+                    "dry_run_update",
+                    submission_index=index,
+                    email=email,
+                    properties=checkbox_values,
+                )
                 continue
 
             if update_contact(contact_id, checkbox_values):
                 stats["updated"] += 1
-                logger.info("✅ Updated %s with %s", email, checkbox_values)
+                log_json(
+                    "update_success",
+                    submission_index=index,
+                    email=email,
+                    properties=checkbox_values,
+                )
             else:
                 stats["errors"] += 1
-                logger.error("❌ Failed to update %s", email)
+                log_json(
+                    "update_failed",
+                    submission_index=index,
+                    email=email,
+                    properties=checkbox_values,
+                )
 
         except Exception as exc:  # pragma: no cover - defensive catch-all
             stats["errors"] += 1
-            logger.exception(
-                "Error processing submission #%s for %s: %s",
-                index,
-                email or "unknown email",
-                exc,
+            log_json(
+                "exception",
+                submission_index=index,
+                email=email,
+                error=str(exc),
             )
 
-    logger.info("Run complete. Stats: %s", stats)
+    log_json("run_complete", dry_run=dry_run, **stats)
     return stats
 
 
@@ -237,6 +293,12 @@ def find_contact_by_email(email: str) -> Optional[str]:
         return None
 
     return results[0].get("id")
+
+
+def log_json(event: str, **data: object) -> None:
+    """Log a structured JSON line for easier downstream parsing."""
+
+    logger.info(json.dumps({"event": event, **data}, default=str))
 
 
 def update_contact(contact_id: str, props: Dict[str, str]) -> bool:
