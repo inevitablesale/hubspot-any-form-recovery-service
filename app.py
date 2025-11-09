@@ -1,7 +1,7 @@
-"""FastAPI service to recover HubSpot consent preferences sequentially (supports POST + GET trigger)."""
+"""FastAPI service to recover and log HubSpot consent preferences (no updates)."""
 
 from __future__ import annotations
-import json, logging, os, time
+import logging, os, time
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
@@ -39,17 +39,16 @@ file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 logger.addHandler(file_handler)
 
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
-logger.info("Starting HubSpot Recovery Service")
+logger.info("Starting HubSpot Recovery Service (v1 – read-only)")
 logger.info("DRY_RUN=%s | LOG_FILE=%s", DRY_RUN, LOG_FILE)
 
 # --- FastAPI app ---
-app = FastAPI(title="HubSpot Form Recovery – Sequential Version")
+app = FastAPI(title="HubSpot Form Recovery – v1 Read-Only Version")
 
 # --- HubSpot configuration ---
 HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
 DEFAULT_FORM_ID = os.getenv("HUBSPOT_FORM_ID", "")
-HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID")
 
 CHECKBOX_PROPERTIES = [
     prop.strip()
@@ -63,9 +62,9 @@ CHECKBOX_PROPERTIES = [
 
 logger.info("Configured checkbox fields: %s", ", ".join(CHECKBOX_PROPERTIES))
 
-FORM_PAGE_SIZE = 1000
+FORM_PAGE_SIZE = 50  # v1 max limit
 FETCH_DELAY = 0.2
-UPDATE_DELAY = 0.25
+
 
 # --- Helpers ---
 def hubspot_headers(include_content_type: bool = True) -> Dict[str, str]:
@@ -90,7 +89,7 @@ class RunRequest(BaseModel):
 class RunSummary(BaseModel):
     dry_run: bool
     processed: int
-    updated: int
+    parsed: int
     skipped: int
     errors: int
 
@@ -103,7 +102,7 @@ def execute_recovery(form_id: str, dry_run: bool) -> RunSummary:
     logger.info("Running recovery for form: %s | dry_run=%s", form_id, dry_run)
 
     submissions = fetch_all_submissions(form_id)
-    stats = process_submissions(submissions, dry_run=dry_run)
+    stats = process_submissions(submissions)
     return RunSummary(dry_run=dry_run, **stats)
 
 
@@ -125,44 +124,42 @@ def run_recovery_get(
     return execute_recovery(form_id, bool(dry_run))
 
 
-# --- Fetch submissions (v2 only) ---
+# --- Fetch submissions (v1 version) ---
 def fetch_all_submissions(form_id: str) -> List[Dict]:
     submissions: List[Dict] = []
-    offset: Optional[str] = None
-    has_more = True
+    after: Optional[str] = None
 
-    logger.info("Fetching submissions from HubSpot API (/form/v2)...")
-    url = f"{HUBSPOT_BASE_URL}/form/v2/forms/{form_id}/submissions"
+    logger.info("Fetching submissions from HubSpot API (/form-integrations/v1)...")
+    url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
 
-    while has_more:
+    while True:
         params: Dict[str, object] = {"limit": FORM_PAGE_SIZE}
-        if offset:
-            params["offset"] = offset
-        if HUBSPOT_PORTAL_ID:
-            params["portalId"] = HUBSPOT_PORTAL_ID
+        if after:
+            params["after"] = after
 
         response = requests.get(url, headers=hubspot_headers(False), params=params, timeout=30)
         response.raise_for_status()
         payload = response.json()
 
-        page_results = payload.get("results") or payload.get("submissions") or []
+        page_results = payload.get("results") or []
         submissions.extend(page_results)
         logger.info("Fetched %s new submissions (total=%s)", len(page_results), len(submissions))
 
-        has_more = payload.get("hasMore", False)
-        offset = payload.get("continuationOffset") or payload.get("offset")
+        paging = payload.get("paging", {})
+        after = paging.get("next", {}).get("after")
         time.sleep(FETCH_DELAY)
 
-        if not has_more:
+        if not after:
             break
 
     logger.info("Total submissions fetched: %s", len(submissions))
     return submissions
 
 
-# --- Process & Update ---
-def process_submissions(submissions: List[Dict], *, dry_run: bool) -> Dict[str, int]:
-    stats = {"processed": 0, "updated": 0, "skipped": 0, "errors": 0}
+# --- Parse & Log Consent Values ---
+def process_submissions(submissions: List[Dict]) -> Dict[str, int]:
+    stats = {"processed": 0, "parsed": 0, "skipped": 0, "errors": 0}
+
     for i, submission in enumerate(submissions, start=1):
         stats["processed"] += 1
         try:
@@ -171,28 +168,19 @@ def process_submissions(submissions: List[Dict], *, dry_run: bool) -> Dict[str, 
                 stats["skipped"] += 1
                 continue
 
-            contact_id = find_contact_by_email(email)
-            if not contact_id:
-                stats["skipped"] += 1
-                continue
-
-            if dry_run:
-                logger.info("DRY RUN — would update %s with %s", email, checkboxes)
-                stats["updated"] += 1
-                continue
-
-            update_contact(contact_id, checkboxes)
-            stats["updated"] += 1
+            stats["parsed"] += 1
+            logger.info("[%s] %s → %s", i, email, json.dumps(checkboxes))
         except Exception as e:
             stats["errors"] += 1
             logger.error("Error processing submission %s: %s", i, e)
+
     return stats
 
 
-# --- Parse consent values ---
 def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
     email, states = None, {}
-    for item in submission.get("values", []):
+    values = submission.get("values", submission.get("formValues", []))
+    for item in values:
         name, value = item.get("name"), item.get("value")
         if not name or not isinstance(value, str):
             continue
@@ -201,34 +189,6 @@ def parse_submission(submission: Dict) -> Tuple[Optional[str], Dict[str, str]]:
         elif name in CHECKBOX_PROPERTIES and value.strip() in ("Checked", "Not Checked"):
             states[name] = value.strip()
     return email, states
-
-
-# --- Contact search & update ---
-def find_contact_by_email(email: str) -> Optional[str]:
-    payload = {
-        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
-        "limit": 1,
-    }
-    response = requests.post(
-        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search",
-        headers=hubspot_headers(),
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    results = response.json().get("results", [])
-    return results[0].get("id") if results else None
-
-
-def update_contact(contact_id: str, props: Dict[str, str]) -> None:
-    response = requests.patch(
-        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{contact_id}",
-        headers=hubspot_headers(),
-        json={"properties": props},
-        timeout=30,
-    )
-    response.raise_for_status()
-    time.sleep(UPDATE_DELAY)
 
 
 # --- Health check ---
