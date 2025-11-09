@@ -1,158 +1,144 @@
-# HubSpot Registration Form Recovery Automation
+# HubSpot Registration Form Recovery Service
 
-This guide walks through building a Zapier automation that recovers consent preferences from HubSpot form submissions and syncs them to the corresponding contact records. The automation runs every weekday morning, fetches the most recent submissions from the `#registerForm`, parses the consent checkboxes, and updates the matching HubSpot contacts.
+This project provides a small FastAPI service that repairs consent preferences for the `#registerForm` HubSpot form. When the `/run`
+endpoint is triggered (for example by a webhook or scheduled job), the service downloads the most recent form submissions, extracts
+the consent checkbox values, and updates existing HubSpot contacts. It is intended for one-off or ad-hoc recovery runs that you can
+host on [Render](https://render.com/) or any container-friendly platform.
+
+---
+
+## Features
+
+- **On-demand execution** – Runs only when the `/run` webhook is invoked; no Zapier dependencies.
+- **Form submission recovery** – Fetches up to 500 submissions from HubSpot and re-applies the consent values to the matching
+  contacts.
+- **Contact safety** – Updates only the `portal_terms_accepted` and `marketing_opt_in_vrm_properties` properties when a matching
+  email is found.
+- **Structured responses** – Returns a JSON summary detailing how many submissions were processed, updated, skipped, or produced
+  errors.
 
 ---
 
 ## Prerequisites
 
-- A Zapier account with access to the **Schedule by Zapier**, **Looping by Zapier**, **Formatter by Zapier**, and **Code by Zapier** apps
-- HubSpot account credentials with API access and permission to read form submissions and update contacts
-- The HubSpot form ID `4750ad3c-bf26-4378-80f6-e7937821533f` (the `#registerForm`)
+- Python 3.10+
+- HubSpot private app token with permission to read form submissions and update contacts
+- HubSpot form ID `4750ad3c-bf26-4378-80f6-e7937821533f`
+
+Set the following environment variables before running the service:
+
+| Variable | Description |
+| --- | --- |
+| `HUBSPOT_PRIVATE_APP_TOKEN` | Required. HubSpot private app token used for all API requests. |
+| `HUBSPOT_FORM_ID` | Optional. Defaults to `4750ad3c-bf26-4378-80f6-e7937821533f`. |
+| `HUBSPOT_BASE_URL` | Optional. Override HubSpot base URL for testing (default `https://api.hubapi.com`). |
+
+You can place these values in a `.env` file when running locally (the app uses `python-dotenv`).
 
 ---
 
-## High-Level Flow
+## Running Locally
 
-1. Schedule the Zap to run every weekday at 9:00 AM.
-2. Retrieve up to 500 submissions for the registration form via the HubSpot Forms API.
-3. Loop over each submission returned.
-4. Extract the submitter’s email address.
-5. Parse the checkbox fields to determine consent values.
-6. Locate the HubSpot contact that matches the extracted email.
-7. Update the contact’s consent properties with the parsed values.
+1. Install dependencies:
 
-The Zap never creates new contacts; it only updates consent fields on existing records.
+   ```bash
+   pip install -r requirements.txt
+   ```
 
----
+2. Export the required environment variables or create a `.env` file:
 
-## Step-by-Step Build Instructions
+   ```bash
+   export HUBSPOT_PRIVATE_APP_TOKEN="your-private-app-token"
+   export HUBSPOT_FORM_ID="4750ad3c-bf26-4378-80f6-e7937821533f"
+   ```
 
-### 1. Schedule Trigger
-- **App**: Schedule by Zapier
-- **Event**: *Every Day*
-- **Configuration**:
-  - Time: `9:00 AM`
-  - Choose "*Weekdays*" so the Zap runs Monday–Friday only
+3. Start the FastAPI app with Uvicorn:
 
-Purpose: ensures the recovery process runs once per business day during working hours.
+   ```bash
+   uvicorn app:app --host 0.0.0.0 --port 8000
+   ```
 
-### 2. Fetch Form Submissions
-- **App**: HubSpot API Request (Beta)
-- **Event**: *Custom Request*
-- **Configuration**:
-  - Method: `GET`
-  - URL: `/form-integrations/v1/submissions/forms/4750ad3c-bf26-4378-80f6-e7937821533f`
-  - Query String Parameters: `limit = 500`
+4. Trigger a run by sending a POST request to the `/run` endpoint (no body required, although you can supply an optional `limit`):
 
-Purpose: retrieves up to 500 submissions for the registration form in a single run. The response body contains the `results` array used in later steps.
+   ```bash
+   curl -X POST http://localhost:8000/run
+   # or override the limit
+   curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"limit": 200}'
+   ```
 
-### 3. Loop Through Submissions
-- **App**: Looping by Zapier
-- **Event**: *Create Loop From Line Items*
-- **Configuration**:
-  - Loop Values: `{{HubSpot API Request → results}}`
-  - Max Iterations: `500`
-
-Purpose: processes each submission individually to keep contact lookups and updates targeted.
-
-### 4. Extract the Email Address
-- **App**: Formatter by Zapier
-- **Event**: *Text → Extract Email Address*
-- **Input**: `{{Loop → submission}}`
-
-Purpose: isolates the email string from the submission payload so it can be used in the HubSpot contact search.
-
-### 5. Parse Checkbox Values (Python Code)
-- **App**: Code by Zapier
-- **Event**: *Run Python*
-- **Input**:
-  - Pass the entire loop item JSON (e.g., `submission`) as an input variable.
-- **Sample Code**:
-
-  ```python
-  import json
-
-  submission = json.loads(input_data["submission"])
-
-  checkbox_fields = {
-      "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Portal Terms Accepted",
-      "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information": "Marketing Opt-In (VRM Properties)",
-  }
-
-  output = {
-      "Portal Terms Accepted": "Not Checked",
-      "Marketing Opt-In (VRM Properties)": "Not Checked",
-  }
-
-  for value in submission.get("values", []):
-      name = value.get("name")
-      if name in checkbox_fields:
-          label = checkbox_fields[name]
-          output[label] = "Checked" if value.get("value") == "Checked" else "Not Checked"
-
-  return output
-  ```
-
-Purpose: converts the checkbox data from the submission into clean "Checked" / "Not Checked" strings without hard-coded defaults beyond the two relevant fields.
-
-### 6. Find the Contact by Email
-- **App**: HubSpot
-- **Event**: *Find Contact*
-- **Configuration**:
-  - Search Property: `email`
-  - Search Value: `{{Formatter → Email Address}}`
-  - Success on Miss: `False`
-  - Multiple Matches: `First`
-
-Purpose: ensures the Zap only proceeds for existing contacts. If no match is found the loop iteration ends without attempting an update.
-
-### 7. Update Contact Consent Fields
-- **App**: HubSpot
-- **Event**: *Update Contact*
-- **Configuration**:
-  - Contact ID: `{{Find Contact → Record ID}}`
-  - Properties:
-    - `portal_terms_accepted`: `{{Code → Portal Terms Accepted}}`
-    - `marketing_opt_in_vrm_properties`: `{{Code → Marketing Opt-In (VRM Properties)}}`
-
-Purpose: writes the parsed checkbox states back to the contact record while leaving all other properties untouched.
-
----
-
-## Safeguards and Best Practices
-
-- **No new contacts**: The Zap updates only if a matching contact exists, preventing duplicate records.
-- **Minimal scope updates**: Only the consent fields are updated to avoid overwriting other profile data.
-- **Daily batch window**: Capping the loop at 500 items respects HubSpot rate limits while covering the day’s submissions.
-- **Error visibility**: Failed API calls stop the Zap, making it clear when manual intervention is needed.
-
----
-
-## Form Response Structure Reference
-
-HubSpot returns each submission in the following format:
+A successful request returns a payload similar to:
 
 ```json
 {
-  "values": [
-    {"name": "email", "value": "contact@example.com"},
-    {"name": "firstname", "value": "John"},
-    {"name": "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "value": "Checked"},
-    {"name": "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information", "value": "Not Checked"}
-  ]
+  "processed": 42,
+  "updated": 35,
+  "skipped": 6,
+  "errors": 1
 }
 ```
 
-Use this structure to confirm the correct field names and values in the parsing step.
+---
+
+## Deploying to Render
+
+1. Create a new **Web Service** in Render and point it at this repository.
+2. Choose a Python environment and set the start command to:
+
+   ```bash
+   uvicorn app:app --host 0.0.0.0 --port $PORT
+   ```
+
+3. Add the required environment variables in the Render dashboard:
+   - `HUBSPOT_PRIVATE_APP_TOKEN`
+   - (Optional) `HUBSPOT_FORM_ID`
+   - (Optional) `HUBSPOT_BASE_URL`
+
+4. After deployment, trigger the automation by issuing a POST request to `https://<your-render-service>.onrender.com/run`.
+   You can call this endpoint from another system, a manual curl command, or any workflow tool that supports webhooks.
 
 ---
 
-## Maintenance Tips
+## How the Service Works
 
-- Periodically review submission volume to confirm the 500-item limit is sufficient.
-- Monitor HubSpot property API names in case they change during portal configuration updates.
-- Log Zap runs and review error notifications to catch issues quickly.
-- Test the Zap after any HubSpot form or property changes to ensure the parsing logic still aligns with the payload.
+1. **Fetch submissions** – Calls `GET /form-integrations/v1/submissions/forms/{formId}` with the provided limit (default 500).
+2. **Parse checkbox values** – Reads the `values` array from each submission and extracts:
+   - `i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy` → `portal_terms_accepted`
+   - `select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information` →
+     `marketing_opt_in_vrm_properties`
+3. **Find matching contact** – Uses the HubSpot CRM search endpoint to locate the contact by exact email.
+4. **Update contact** – Patches the contact with the parsed consent values. If the contact is missing or an error occurs, the
+   service records the skipped/error count but continues processing the remaining submissions.
 
-This automation offers a reliable recovery mechanism to keep HubSpot consent preferences aligned with the latest form submissions.
+All processing happens synchronously within the request so you immediately receive a status summary. For large batches you can
+lower the `limit` or trigger multiple runs to stay within HubSpot rate limits.
+
+---
+
+## Extending the Service
+
+- **Add logging destinations** – The app uses standard Python logging; configure handlers (e.g., JSON logging, external aggregators)
+  as needed.
+- **Custom property mapping** – Update the `CHECKBOX_FIELDS` constant in `app.py` if the HubSpot property names change.
+- **Alternate triggers** – Because the service is HTTP-based, you can connect it to any scheduler or automation platform that can
+  send webhook requests.
+
+---
+
+## Troubleshooting
+
+- HTTP 500 errors usually indicate missing configuration (e.g., token not set). Check the Render service logs or local console for
+  stack traces.
+- HTTP 502 responses typically originate from HubSpot API failures. Review the message returned in the JSON body or logs.
+- Ensure the HubSpot private app token has access to both **Forms** and **CRM** scopes.
+
+---
+
+## Repository Structure
+
+```
+app.py             # FastAPI app entry point and HubSpot recovery logic
+requirements.txt  # Python dependencies for the web service
+README.md         # This documentation
+```
+
+This setup allows you to run the recovery process on demand without relying on Zapier.
