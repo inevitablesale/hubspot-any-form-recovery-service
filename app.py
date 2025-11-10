@@ -75,7 +75,7 @@ def health():
 # Fetch ALL submissions (paged)
 # ---------------------------------------------------------------------
 
-@app.post("/run-fetch")
+@app.api_route("/run-fetch", methods=["GET", "POST"])
 def run_fetch(form_id: str = DEFAULT_FORM_ID, max_pages: int = 9999):
     """Fetch all form submissions and write paginated JSONL files to /data."""
     logger.info("🚀 Starting full form fetch for %s", form_id)
