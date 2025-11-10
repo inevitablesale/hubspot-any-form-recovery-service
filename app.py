@@ -6,6 +6,7 @@ Includes:
 ✅ Batch fetch, dedupe, recovery, and reporting for >17k submissions
 ✅ Fully safe — no writes to system-managed properties like hs_marketable_status
 ✅ Enhanced logging of form checkbox values and payloads for each record
+✅ Always updates both consent fields (Opt-In + Terms) exactly as submitted
 """
 
 from __future__ import annotations
@@ -153,15 +154,15 @@ def run_dedupe():
 
 
 # ---------------------------------------------------------------------
-# Recovery runner – safe consent updates with resume + detailed logging
+# Recovery runner – always updates both consent fields + logs
 # ---------------------------------------------------------------------
 
 @app.post("/run-recover")
 def run_recover(batch_size: int = 1000):
     """
-    Apply safe consent updates for all deduped submissions.
+    Apply consent updates for all deduped submissions.
+    Always writes both checkbox values exactly as submitted.
     Resumable: tracks progress in cursor.txt.
-    Now logs checkbox values and payload details for every record.
     """
     deduped_path = "data/deduped_submissions.jsonl"
     if not os.path.exists(deduped_path):
@@ -171,44 +172,27 @@ def run_recover(batch_size: int = 1000):
         subs = [json.loads(line) for line in f]
 
     cursor_file = "data/cursor.txt"
-    start_idx = 0
-    if os.path.exists(cursor_file):
-        start_idx = int(open(cursor_file).read().strip() or 0)
-        logger.info("⏩ Resuming from index %s", start_idx)
+    start_idx = int(open(cursor_file).read().strip() or 0) if os.path.exists(cursor_file) else 0
 
-    success, skipped, errors = 0, 0, 0
+    success, errors = 0, 0
 
     for i, s in enumerate(subs[start_idx:], start=start_idx):
         try:
             email, boxes = parse_submission(s)
             if not email:
-                skipped += 1
                 continue
-
             cid = find_contact_by_email(email)
             if not cid:
-                skipped += 1
+                logger.info("🚫 [%s/%s] No HubSpot contact for %s", i + 1, len(subs), email)
                 continue
 
-            opt_in = boxes.get("select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information")
-            tos = boxes.get("i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy")
-
-            if opt_in != "Checked":
-                logger.info(
-                    "⏭️ [%s/%s] Skipped %s — Opt-In: %s, Terms: %s",
-                    i + 1,
-                    len(subs),
-                    email,
-                    opt_in or "—",
-                    tos or "—",
-                )
-                skipped += 1
-                continue
-
+            # Always send both values exactly as submitted (default to "Not Checked")
             payload = {
                 "properties": {
-                    "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information": "Checked",
-                    "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Checked",
+                    "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information":
+                        boxes.get("select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information", "Not Checked"),
+                    "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy":
+                        boxes.get("i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "Not Checked"),
                 }
             }
 
@@ -220,7 +204,7 @@ def run_recover(batch_size: int = 1000):
             )
 
             if not r.ok:
-                logger.error("❌ Update failed for %s: %s", email, r.text)
+                logger.error("❌ [%s/%s] Update failed for %s: %s", i + 1, len(subs), email, r.text)
                 errors += 1
                 continue
 
@@ -250,8 +234,8 @@ def run_recover(batch_size: int = 1000):
     with open(cursor_file, "w") as f:
         f.write(str(len(subs)))
 
-    logger.info("🏁 Recovery completed — Success: %s, Skipped: %s, Errors: %s", success, skipped, errors)
-    return {"success": success, "skipped": skipped, "errors": errors, "total": len(subs)}
+    logger.info("🏁 Recovery completed — Success: %s, Errors: %s", success, errors)
+    return {"success": success, "errors": errors, "total": len(subs)}
 
 
 # ---------------------------------------------------------------------
