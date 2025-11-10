@@ -1,7 +1,7 @@
 """FastAPI service to audit HubSpot consent preferences (read-only)."""
 
 from __future__ import annotations
-import json, logging, os, time
+import json, logging, os, time, signal, sys
 from collections import Counter
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
@@ -66,6 +66,24 @@ class RunSummary(BaseModel):
     report_file: str
 
 
+# ---------------------------------------------------------------------
+# HEALTH AND KILL ENDPOINTS
+# ---------------------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    """Return 200 OK for health probes."""
+    return {"status": "ok"}
+
+@app.post("/kill")
+def kill_process():
+    """Gracefully stop the service."""
+    logger.warning("Kill command received — shutting down process...")
+    os.kill(os.getpid(), signal.SIGTERM)
+    return {"status": "terminated"}
+
+# ---------------------------------------------------------------------
+
 @app.post("/run", response_model=RunSummary)
 def run_recovery(request: Optional[RunRequest] = None) -> RunSummary:
     form_id = (request.form_id or DEFAULT_FORM_ID or "").strip() if request else DEFAULT_FORM_ID
@@ -79,7 +97,7 @@ def run_recovery(request: Optional[RunRequest] = None) -> RunSummary:
 
 
 # ---------------------------------------------------------------------
-# FIXED FETCH LOOP — prevents infinite looping when HubSpot misreports pagination
+# FETCH LOOP WITH SAFE EXIT CONDITIONS
 # ---------------------------------------------------------------------
 
 def fetch_all_submissions(form_id: str) -> List[Dict]:
