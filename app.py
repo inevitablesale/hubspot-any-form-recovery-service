@@ -95,7 +95,7 @@ def run_preview_audit(request: Optional[RunRequest] = None) -> RunSummary:
     if not form_id:
         raise HTTPException(status_code=500, detail="HUBSPOT_FORM_ID required")
 
-    logger.info("🚀 Starting smoke test (first 50 submissions) for form %s", form_id)
+    logger.info("🚀 Starting smoke test (first 100 submissions) for form %s", form_id)
     subs = fetch_first_n_submissions(form_id, n=100)
     deduped = deduplicate_by_latest(subs)
     stats = process_submissions(deduped, report_name="marketing_audit_smoketest.jsonl")
@@ -173,8 +173,9 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest
                     action = "→ WOULD UPDATE to FALSE (Opt-In Not Checked, Forms #registerForm)"
                 else:
                     action = "→ NO CHANGE (Status false and consistent)"
-            elif status == "true" and opt_in_value == "Not Checked":
-                action = "→ WOULD UPDATE to FALSE (Currently marketing but form opted out)"
+            elif status == "true":
+                # Keep as marketing contact regardless of form checkbox
+                action = "→ NO CHANGE (Already marketing contact; form opt-out ignored)"
             else:
                 action = "→ NO CHANGE (Status aligns with form)"
 
