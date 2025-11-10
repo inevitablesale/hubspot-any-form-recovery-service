@@ -94,20 +94,43 @@ def run_preview_audit(request: Optional[RunRequest] = None) -> RunSummary:
     return RunSummary(**stats)
 
 
+# ---------------------------------------------------------------------
+# Fetch submissions with pagination (HubSpot limit = 50 per request)
+# ---------------------------------------------------------------------
+
 def fetch_first_n_submissions(form_id: str, n: int = 250) -> List[Dict]:
-    """Fetch the first N submissions (no pagination, read-only)."""
-    logger.info("🧪 Preview mode active — fetching up to %d submissions (read-only)", n)
-    r = requests.get(
-        f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}",
-        headers=hubspot_headers(False),
-        params={"limit": n},
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    subs = data.get("results", [])[:n]
-    logger.info("✅ Retrieved %s submissions (smoke test mode)", len(subs))
-    return subs
+    """Fetch up to N submissions using HubSpot's paginated form API."""
+    logger.info("🧪 Preview mode active — fetching up to %d submissions (paginated, read-only)", n)
+    submissions, after = [], None
+
+    while len(submissions) < n:
+        params = {"limit": 50}  # HubSpot max allowed
+        if after:
+            params["after"] = after
+
+        r = requests.get(
+            f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}",
+            headers=hubspot_headers(False),
+            params=params,
+            timeout=30,
+        )
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="Form not found or deleted.")
+        r.raise_for_status()
+
+        data = r.json()
+        results = data.get("results", [])
+        submissions.extend(results)
+        after = data.get("paging", {}).get("next", {}).get("after")
+
+        logger.info("📄 Retrieved %s submissions so far...", len(submissions))
+        if not after or not results:
+            break
+        time.sleep(0.5)  # rate-limit protection
+
+    submissions = submissions[:n]
+    logger.info("✅ Retrieved %s total submissions (smoke test mode)", len(submissions))
+    return submissions
 
 
 # ---------------------------------------------------------------------
