@@ -79,7 +79,7 @@ def kill_process():
 # Single record update – Safe write test
 # ---------------------------------------------------------------------
 
-@app.api_route("/run-single", methods=["POST"])
+@app.api_route("/run-single", methods=["GET", "POST"])
 def run_single_update(email: str = "josholson@jonesbororealtycompany.com"):
     """
     Test updating one HubSpot contact with form opt-in and terms acceptance.
