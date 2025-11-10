@@ -141,7 +141,7 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_preview.j
                 stats["skipped"] += 1
                 continue
             stats["contacts_found"] += 1
-            status, reason = get_marketing_contact_status(cid)
+            status, reason, reason_type, reason_id = get_marketing_contact_status(cid)
             if status:
                 status_counts[status] += 1
             if reason:
@@ -151,6 +151,8 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_preview.j
                 "form_values": boxes,
                 "hs_marketable_status": status,
                 "hs_marketable_reason": reason,
+                "hs_marketable_reason_type": reason_type,
+                "hs_marketable_reason_id": reason_id,
             }
             with open(report_name, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
@@ -203,16 +205,34 @@ def find_contact_by_email(email: str) -> Optional[str]:
     return res[0].get("id") if res else None
 
 
-def get_marketing_contact_status(cid: str) -> Tuple[Optional[str], Optional[str]]:
+def get_marketing_contact_status(cid: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return marketing status and reason fields, including type/id."""
     r = requests.get(
         f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{cid}",
         headers=hubspot_headers(),
-        params={"properties": ["hs_marketable_status", "hs_marketable_reason"]},
+        params={
+            "properties": [
+                "hs_marketable_status",
+                "hs_marketable_reason",
+                "hs_marketable_reason_type",
+                "hs_marketable_reason_id",
+            ]
+        },
         timeout=30,
     )
     r.raise_for_status()
     p = r.json().get("properties", {})
-    return p.get("hs_marketable_status"), p.get("hs_marketable_reason")
+
+    status = p.get("hs_marketable_status")
+    reason = p.get("hs_marketable_reason")
+    reason_type = p.get("hs_marketable_reason_type")
+    reason_id = p.get("hs_marketable_reason_id")
+
+    # If reason missing, combine manually for UI-style string
+    if not reason and (reason_type or reason_id):
+        reason = f"{reason_type or ''} → {reason_id or ''}".strip(" →")
+
+    return status, reason, reason_type, reason_id
 
 
 # ---------------------------------------------------------------------
