@@ -1,4 +1,5 @@
-"""FastAPI service to audit the first 250 HubSpot form submissions (read-only smoke test with simulated actions)."""
+"""FastAPI service to audit the first 250 HubSpot form submissions (read-only smoke test with simulated actions)
+and safely update a single contact for verification (write test)."""
 
 from __future__ import annotations
 import json, logging, os, time
@@ -93,11 +94,10 @@ def run_single_update(email: str = "josholson@jonesbororealtycompany.com"):
     status, reason, reason_type, reason_id = get_marketing_contact_status(cid)
     logger.info("Before update: hs_marketable_status=%s | reason=%s", status, reason)
 
-    # Define updates (ensure correct internal property names)
+    # Define updates (ensure valid internal property names only)
     payload = {
         "properties": {
             "hs_marketable_status": "true",
-            "hs_marketable_reason": "#registerForm",
             "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information": "Checked",
             "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Checked",
         }
