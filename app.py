@@ -5,18 +5,17 @@ Includes:
 ✅ Smoke test & trace routes
 ✅ Batch fetch, dedupe, recovery, and reporting for >17k submissions
 ✅ Fully safe — no writes to system-managed properties like hs_marketable_status
+✅ Enhanced logging of form checkbox values and payloads for each record
 """
 
 from __future__ import annotations
 import json, logging, os, time, glob
-from collections import Counter
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 # ---------------------------------------------------------------------
 # Environment setup
@@ -154,14 +153,15 @@ def run_dedupe():
 
 
 # ---------------------------------------------------------------------
-# Recovery runner – safe consent updates with resume
+# Recovery runner – safe consent updates with resume + detailed logging
 # ---------------------------------------------------------------------
 
 @app.post("/run-recover")
 def run_recover(batch_size: int = 1000):
     """
     Apply safe consent updates for all deduped submissions.
-    Resumable: tracks progress in cursor.txt
+    Resumable: tracks progress in cursor.txt.
+    Now logs checkbox values and payload details for every record.
     """
     deduped_path = "data/deduped_submissions.jsonl"
     if not os.path.exists(deduped_path):
@@ -170,7 +170,6 @@ def run_recover(batch_size: int = 1000):
     with open(deduped_path, "r", encoding="utf-8") as f:
         subs = [json.loads(line) for line in f]
 
-    # Resume from cursor
     cursor_file = "data/cursor.txt"
     start_idx = 0
     if os.path.exists(cursor_file):
@@ -185,12 +184,24 @@ def run_recover(batch_size: int = 1000):
             if not email:
                 skipped += 1
                 continue
+
             cid = find_contact_by_email(email)
             if not cid:
                 skipped += 1
                 continue
 
-            if boxes.get("select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information") != "Checked":
+            opt_in = boxes.get("select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information")
+            tos = boxes.get("i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy")
+
+            if opt_in != "Checked":
+                logger.info(
+                    "⏭️ [%s/%s] Skipped %s — Opt-In: %s, Terms: %s",
+                    i + 1,
+                    len(subs),
+                    email,
+                    opt_in or "—",
+                    tos or "—",
+                )
                 skipped += 1
                 continue
 
@@ -200,19 +211,30 @@ def run_recover(batch_size: int = 1000):
                     "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Checked",
                 }
             }
+
             r = requests.patch(
                 f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{cid}",
                 headers=hubspot_headers(),
                 json=payload,
                 timeout=30,
             )
+
             if not r.ok:
                 logger.error("❌ Update failed for %s: %s", email, r.text)
                 errors += 1
                 continue
 
             success += 1
-            logger.info("✅ [%s/%s] Updated %s", i + 1, len(subs), email)
+            logger.info(
+                "✅ [%s/%s] Updated %s\n"
+                "    → Form Values: %s\n"
+                "    → Payload Sent: %s",
+                i + 1,
+                len(subs),
+                email,
+                json.dumps(boxes, indent=2),
+                json.dumps(payload['properties'], indent=2),
+            )
 
         except Exception as e:
             logger.error("⚠️ Error on record %s: %s", i, e)
@@ -223,10 +245,11 @@ def run_recover(batch_size: int = 1000):
                 f.write(str(i + 1))
             logger.info("💾 Progress saved (%s processed)", i + 1)
 
-        time.sleep(0.6)  # respect HubSpot limits
+        time.sleep(0.6)
 
     with open(cursor_file, "w") as f:
         f.write(str(len(subs)))
+
     logger.info("🏁 Recovery completed — Success: %s, Skipped: %s, Errors: %s", success, skipped, errors)
     return {"success": success, "skipped": skipped, "errors": errors, "total": len(subs)}
 
