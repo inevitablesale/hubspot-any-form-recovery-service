@@ -76,7 +76,55 @@ def kill_process():
 
 
 # ---------------------------------------------------------------------
-# Smoke Test – First 250 Submissions Only (with simulated actions)
+# Single record update – Safe write test
+# ---------------------------------------------------------------------
+
+@app.api_route("/run-single", methods=["POST"])
+def run_single_update(email: str = "josholson@jonesbororealtycompany.com"):
+    """
+    Test updating one HubSpot contact with form opt-in and terms acceptance.
+    Safe for one-off verification.
+    """
+    cid = find_contact_by_email(email)
+    if not cid:
+        raise HTTPException(status_code=404, detail=f"Contact not found for {email}")
+
+    logger.info("🧩 Found contact %s (%s). Fetching current properties...", email, cid)
+    status, reason, reason_type, reason_id = get_marketing_contact_status(cid)
+    logger.info("Before update: hs_marketable_status=%s | reason=%s", status, reason)
+
+    # Define updates (ensure correct internal property names)
+    payload = {
+        "properties": {
+            "hs_marketable_status": "true",
+            "hs_marketable_reason": "#registerForm",
+            "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information": "Checked",
+            "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy": "Checked",
+        }
+    }
+
+    r = requests.patch(
+        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{cid}",
+        headers=hubspot_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if not r.ok:
+        logger.error("❌ HubSpot update failed: %s", r.text)
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    result = r.json()
+    logger.info("✅ Successfully updated %s", email)
+    return {
+        "email": email,
+        "contact_id": cid,
+        "updated_properties": payload["properties"],
+        "hubspot_response": result,
+    }
+
+
+# ---------------------------------------------------------------------
+# Smoke Test – First 250 Submissions Only (read-only)
 # ---------------------------------------------------------------------
 
 @app.api_route("/run-preview", methods=["GET", "POST"], response_model=RunSummary)
@@ -104,7 +152,7 @@ def fetch_first_n_submissions(form_id: str, n: int = 250) -> List[Dict]:
     submissions, after = [], None
 
     while len(submissions) < n:
-        params = {"limit": 50}  # HubSpot max allowed
+        params = {"limit": 50}
         if after:
             params["after"] = after
 
@@ -126,7 +174,7 @@ def fetch_first_n_submissions(form_id: str, n: int = 250) -> List[Dict]:
         logger.info("📄 Retrieved %s submissions so far...", len(submissions))
         if not after or not results:
             break
-        time.sleep(0.5)  # rate-limit protection
+        time.sleep(0.5)
 
     submissions = submissions[:n]
     logger.info("✅ Retrieved %s total submissions (smoke test mode)", len(submissions))
@@ -183,8 +231,8 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest
                     action = "→ WOULD UPDATE to FALSE (Opt-In Not Checked, Forms #registerForm)"
                 else:
                     action = "→ NO CHANGE (Status false and consistent)"
-            elif status == "true" and opt_in_value == "Not Checked":
-                action = "→ WOULD UPDATE to FALSE (Currently marketing but form opted out)"
+            elif status == "true":
+                action = "→ NO CHANGE (Already marketing — leave as TRUE)"
             else:
                 action = "→ NO CHANGE (Status aligns with form)"
 
@@ -200,23 +248,14 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest
             with open(report_name, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
 
-            logger.info(
-                "[%s/%s] %s | Status: %s | Reason: %s\n%s",
-                i,
-                len(subs),
-                email,
-                status or "—",
-                reason or "—",
-                action,
-            )
+            logger.info("[%s/%s] %s | Status: %s | Reason: %s\n%s",
+                        i, len(subs), email, status or "—", reason or "—", action)
 
         except Exception as e:
             stats["errors"] += 1
             logger.error("Error %s: %s", i, e)
 
     logger.info("✅ Smoke test complete. Report saved to %s", report_name)
-    logger.info("Status counts: %s", dict(status_counts))
-    logger.info("Reason counts: %s", dict(reason_counts))
     return {**stats, "report_file": report_name}
 
 
@@ -256,7 +295,6 @@ def find_contact_by_email(email: str) -> Optional[str]:
 
 
 def get_marketing_contact_status(cid: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Return marketing status and reason fields, including type/id."""
     r = requests.get(
         f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{cid}",
         headers=hubspot_headers(),
@@ -272,16 +310,12 @@ def get_marketing_contact_status(cid: str) -> Tuple[Optional[str], Optional[str]
     )
     r.raise_for_status()
     p = r.json().get("properties", {})
-
-    status = p.get("hs_marketable_status")
-    reason = p.get("hs_marketable_reason")
-    reason_type = p.get("hs_marketable_reason_type")
-    reason_id = p.get("hs_marketable_reason_id")
-
-    if not reason and (reason_type or reason_id):
-        reason = f"{reason_type or ''} → {reason_id or ''}".strip(" →")
-
-    return status, reason, reason_type, reason_id
+    return (
+        p.get("hs_marketable_status"),
+        p.get("hs_marketable_reason"),
+        p.get("hs_marketable_reason_type"),
+        p.get("hs_marketable_reason_id"),
+    )
 
 
 # ---------------------------------------------------------------------
