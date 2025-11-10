@@ -18,7 +18,10 @@ LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 logger = logging.getLogger("hubspot_form_audit")
 logger.setLevel(logging.INFO)
 logger.handlers = []
-for h in (logging.StreamHandler(), RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)):
+for h in (
+    logging.StreamHandler(),
+    RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3),
+):
     h.setFormatter(logging.Formatter(LOG_FORMAT))
     logger.addHandler(h)
 
@@ -76,6 +79,8 @@ def run_recovery(request: Optional[RunRequest] = None) -> RunSummary:
 
 
 # ---------------------------------------------------------------------
+# FIXED FETCH LOOP — prevents infinite looping when HubSpot misreports pagination
+# ---------------------------------------------------------------------
 
 def fetch_all_submissions(form_id: str) -> List[Dict]:
     logger.info("Fetching form submissions...")
@@ -84,6 +89,7 @@ def fetch_all_submissions(form_id: str) -> List[Dict]:
         params = {"limit": FORM_PAGE_SIZE}
         if offset:
             params["offset"] = offset
+
         r = requests.get(
             f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}",
             headers=hubspot_headers(False),
@@ -94,20 +100,38 @@ def fetch_all_submissions(form_id: str) -> List[Dict]:
         data = r.json()
         page = data.get("results", [])
         subs.extend(page)
-        logger.info("Fetched %s (total %s)", len(page), len(subs))
+
+        if len(subs) % 1000 == 0 or not page:
+            logger.info("Fetched %s total submissions so far", len(subs))
+
         has_more = data.get("hasMore", False)
-        offset = str(
+        offset_value = (
             data.get("continuationOffset")
             or data.get("offset")
             or data.get("paging", {}).get("next", {}).get("after")
-            or ""
         )
+
+        # Defensive stop conditions
+        if not page:
+            logger.warning("No results on this page — stopping early to avoid loop")
+            break
+        if has_more and not offset_value:
+            logger.warning(
+                "HubSpot returned hasMore=True but no offset token — stopping to prevent infinite loop"
+            )
+            break
+
+        offset = str(offset_value) if offset_value else None
+
         sleep_for_rate_limit(r.headers, FETCH_DEFAULT_DELAY)
         if not has_more:
             break
-    logger.info("Total submissions: %s", len(subs))
+
+    logger.info("✅ All submissions fetched: %s", len(subs))
     return subs
 
+
+# ---------------------------------------------------------------------
 
 def deduplicate_by_latest(subs: List[Dict]) -> List[Dict]:
     latest: Dict[str, Dict] = {}
@@ -161,13 +185,19 @@ def process_submissions(subs: List[Dict]) -> Dict[str, int]:
             with open(report_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             val = next(iter(boxes.values())) if boxes else "—"
-            logger.info("[%s/%s] %s | Opt-In: %s | Status: %s | Reason: %s",
-                        i, len(subs), email, val, status or "—", reason or "—")
+            logger.info(
+                "[%s/%s] %s | Opt-In: %s | Status: %s | Reason: %s",
+                i,
+                len(subs),
+                email,
+                val,
+                status or "—",
+                reason or "—",
+            )
         except Exception as e:
             stats["errors"] += 1
             logger.error("Error %s: %s", i, e)
 
-    # ---- Summary ----
     logger.info("✅ Audit complete. Report: %s", report_file)
     logger.info("--------------------------------------------------")
     logger.info("Summary Totals:")
