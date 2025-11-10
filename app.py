@@ -1,7 +1,7 @@
 """FastAPI service to audit the first 50 HubSpot form submissions (smoke test, read-only with simulated actions)."""
 
 from __future__ import annotations
-import json, logging, os, time
+import json, logging, os
 from collections import Counter
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
@@ -10,6 +10,10 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# ---------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------
 
 load_dotenv()
 
@@ -32,6 +36,7 @@ app = FastAPI(title="HubSpot Form Audit – Smoke Test (Preview 50 submissions)"
 HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
 DEFAULT_FORM_ID = os.getenv("HUBSPOT_FORM_ID", "4750ad3c-bf26-4378-80f6-e7937821533f")
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
+
 CHECKBOX_PROPERTIES = [
     p.strip()
     for p in os.getenv(
@@ -52,6 +57,10 @@ def hubspot_headers(ct: bool = True) -> Dict[str, str]:
     return h
 
 
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
+
 class RunRequest(BaseModel):
     form_id: Optional[str] = None
 
@@ -64,6 +73,10 @@ class RunSummary(BaseModel):
     report_file: str
 
 
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -75,10 +88,6 @@ def kill_process():
     os._exit(0)
 
 
-# ---------------------------------------------------------------------
-# Smoke Test – First 50 Submissions Only (with simulated actions)
-# ---------------------------------------------------------------------
-
 @app.api_route("/run-preview", methods=["GET", "POST"], response_model=RunSummary)
 def run_preview_audit(request: Optional[RunRequest] = None) -> RunSummary:
     """Fetch and audit only the first 50 submissions for a quick validation run."""
@@ -87,12 +96,16 @@ def run_preview_audit(request: Optional[RunRequest] = None) -> RunSummary:
         raise HTTPException(status_code=500, detail="HUBSPOT_FORM_ID required")
 
     logger.info("🚀 Starting smoke test (first 50 submissions) for form %s", form_id)
-    subs = fetch_first_n_submissions(form_id, n=50)
+    subs = fetch_first_n_submissions(form_id, n=100)
     deduped = deduplicate_by_latest(subs)
     stats = process_submissions(deduped, report_name="marketing_audit_smoketest.jsonl")
     logger.info("✅ Smoke test completed successfully.")
     return RunSummary(**stats)
 
+
+# ---------------------------------------------------------------------
+# Fetching and Deduplication
+# ---------------------------------------------------------------------
 
 def fetch_first_n_submissions(form_id: str, n: int = 50) -> List[Dict]:
     """Fetch the first N submissions (no pagination, read-only)."""
@@ -109,11 +122,8 @@ def fetch_first_n_submissions(form_id: str, n: int = 50) -> List[Dict]:
     return subs
 
 
-# ---------------------------------------------------------------------
-# Core processing logic
-# ---------------------------------------------------------------------
-
 def deduplicate_by_latest(subs: List[Dict]) -> List[Dict]:
+    """Keep only the latest submission per email."""
     latest: Dict[str, Dict] = {}
     for s in subs:
         email, _ = parse_submission(s)
@@ -125,6 +135,10 @@ def deduplicate_by_latest(subs: List[Dict]) -> List[Dict]:
     logger.info("Deduplicated %s → %s unique emails", len(subs), len(latest))
     return list(latest.values())
 
+
+# ---------------------------------------------------------------------
+# Processing and Simulated Actions
+# ---------------------------------------------------------------------
 
 def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest.jsonl") -> Dict[str, int]:
     stats = {"processed": 0, "contacts_found": 0, "skipped": 0, "errors": 0}
@@ -173,6 +187,7 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest
                 "hs_marketable_reason_id": reason_id,
                 "simulated_action": action,
             }
+
             with open(report_name, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
 
@@ -197,24 +212,31 @@ def process_submissions(subs: List[Dict], report_name="marketing_audit_smoketest
 
 
 # ---------------------------------------------------------------------
-# Supporting functions
+# Supporting Functions
 # ---------------------------------------------------------------------
 
 def parse_submission(s: Dict) -> Tuple[Optional[str], Dict[str, str]]:
+    """Extract email and checkbox states (Checked/Not Checked only)."""
     vals = s.get("values", [])
     email, consent = None, {}
+
     for v in vals:
         name, val = v.get("name"), v.get("value")
         if not isinstance(name, str) or not isinstance(val, str):
             continue
         if name == "email":
             email = val.strip()
-        elif name in CHECKBOX_PROPERTIES and val.strip() in ("Checked", "Not Checked"):
-            consent[name] = val.strip()
+        elif name in CHECKBOX_PROPERTIES:
+            val_str = val.strip()
+            if val_str not in ("Checked", "Not Checked"):
+                val_str = "Not Checked"  # normalize any unexpected case
+            consent[name] = val_str
+
     return email, consent
 
 
 def find_contact_by_email(email: str) -> Optional[str]:
+    """Find contact ID by email address."""
     payload = {
         "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
         "limit": 1,
@@ -260,6 +282,8 @@ def get_marketing_contact_status(cid: str) -> Tuple[Optional[str], Optional[str]
     return status, reason, reason_type, reason_id
 
 
+# ---------------------------------------------------------------------
+# Local execution entrypoint
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
