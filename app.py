@@ -1,5 +1,5 @@
 """
-HubSpot Form Recovery Service – CSV Edition (Render-Optimized)
+HubSpot Form Recovery Service – CSV Edition (Render-Optimized, Zapier-Safe)
 
 Modes:
 1️⃣ Prep Mode (no start_email):
@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
 # ---------------------------------------------------------------------
@@ -79,8 +79,12 @@ def find_contact_by_email(email: str) -> Optional[str]:
         "limit": 1,
         "properties": ["email"],
     }
-    r = requests.post(f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search",
-                      headers=hubspot_headers(), json=payload, timeout=30)
+    r = requests.post(
+        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search",
+        headers=hubspot_headers(),
+        json=payload,
+        timeout=30,
+    )
     if not r.ok:
         logger.error(f"❌ Search failed for {email}: {r.text}")
         return None
@@ -215,11 +219,32 @@ def recover_contacts(start_email: str, limit: int, rows: List[Dict[str, str]]):
 # ---------------------------------------------------------------------
 
 @app.post("/run-all")
-def run_all(form_id: str = DEFAULT_FORM_ID, start_email: Optional[str] = None, limit: int = 700):
+async def run_all(request: Request,
+                  form_id: str = DEFAULT_FORM_ID,
+                  start_email: Optional[str] = None,
+                  limit: int = 700):
     """Two-mode runner:
     • No start_email → Fetch + Dedupe + Export CSV
     • With start_email → Load uploaded CSV + Recover
     """
+
+    # 🧠 Try to parse JSON or form data — Zapier-safe
+    try:
+        body = await request.json()
+        form_id = body.get("form_id", form_id)
+        start_email = body.get("start_email", start_email)
+        limit = int(body.get("limit", limit))
+    except Exception:
+        form_data = await request.form() if request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded") else {}
+        form_id = form_data.get("form_id", form_id)
+        start_email = form_data.get("start_email", start_email)
+        limit = int(form_data.get("limit", limit))
+
+    # 🧩 Optional auto-resume if CSV is present
+    if not start_email and os.path.exists(UPLOADED_DEDUPED_PATH):
+        logger.info("📁 Auto-detected deduped CSV, forcing Resume Mode.")
+        start_email = ""
+
     def background_job():
         try:
             if start_email:
@@ -259,6 +284,10 @@ def run_all(form_id: str = DEFAULT_FORM_ID, start_email: Optional[str] = None, l
             "download_link": "/download-latest",
         }
     return {"status": "started", "mode": "resume", "message": f"Recovery running from {start_email}"}
+
+# ---------------------------------------------------------------------
+# Other endpoints
+# ---------------------------------------------------------------------
 
 @app.get("/download-latest")
 def download_latest():
