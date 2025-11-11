@@ -7,10 +7,13 @@ Includes:
 ✅ Fully safe — no writes to system-managed properties like hs_marketable_status
 ✅ Enhanced logging of form checkbox values and payloads for each record
 ✅ Always updates both consent fields (Opt-In + Terms) exactly as submitted
+✅ Background-safe execution (no browser/Zapier timeouts)
+✅ Real-time job tracking with /run-report
 """
 
 from __future__ import annotations
-import json, logging, os, time, glob
+import json, logging, os, time, glob, threading
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
@@ -30,7 +33,10 @@ LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 logger = logging.getLogger("hubspot_form_recovery")
 logger.setLevel(logging.INFO)
 logger.handlers = []
-for h in (logging.StreamHandler(), RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)):
+for h in (
+    logging.StreamHandler(),
+    RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3),
+):
     h.setFormatter(logging.Formatter(LOG_FORMAT))
     logger.addHandler(h)
 
@@ -39,7 +45,9 @@ logger.info("Starting HubSpot Form Recovery Service")
 app = FastAPI(title="HubSpot Form Recovery API")
 
 HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
-DEFAULT_FORM_ID = os.getenv("HUBSPOT_FORM_ID", "4750ad3c-bf26-4378-80f6-e7937821533f")
+DEFAULT_FORM_ID = os.getenv(
+    "HUBSPOT_FORM_ID", "4750ad3c-bf26-4378-80f6-e7937821533f"
+)
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
 
 CHECKBOX_PROPERTIES = [
@@ -52,6 +60,36 @@ CHECKBOX_PROPERTIES = [
     if p.strip()
 ]
 
+JOB_STATUS_FILE = "data/job_status.json"
+CURSOR_FILE = "data/cursor.txt"
+
+
+# ---------------------------------------------------------------------
+# Helpers for job tracking
+# ---------------------------------------------------------------------
+
+def update_job_status(**kwargs):
+    """Persist job progress and metadata to disk."""
+    status = {
+        "timestamp": datetime.utcnow().isoformat(),
+        **kwargs,
+    }
+    with open(JOB_STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(status, f, indent=2)
+    logger.info(f"💾 Job status updated: {kwargs}")
+
+
+def read_job_status():
+    """Read current job status."""
+    if not os.path.exists(JOB_STATUS_FILE):
+        return {"status": "idle"}
+    with open(JOB_STATUS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------
+# HubSpot utilities
+# ---------------------------------------------------------------------
 
 def hubspot_headers(ct: bool = True) -> Dict[str, str]:
     if not HUBSPOT_TOKEN:
@@ -62,8 +100,41 @@ def hubspot_headers(ct: bool = True) -> Dict[str, str]:
     return h
 
 
+def parse_submission(s: Dict) -> Tuple[Optional[str], Dict[str, str]]:
+    vals = s.get("values", [])
+    email, consent = None, {}
+    for v in vals:
+        name, val = v.get("name"), v.get("value")
+        if not isinstance(name, str) or not isinstance(val, str):
+            continue
+        if name == "email":
+            email = val.strip()
+        elif name in CHECKBOX_PROPERTIES and val.strip() in ("Checked", "Not Checked"):
+            consent[name] = val.strip()
+    return email, consent
+
+
+def find_contact_by_email(email: str) -> Optional[str]:
+    payload = {
+        "filterGroups": [
+            {"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}
+        ],
+        "limit": 1,
+        "properties": ["email"],
+    }
+    r = requests.post(
+        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search",
+        headers=hubspot_headers(),
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    res = r.json().get("results", [])
+    return res[0].get("id") if res else None
+
+
 # ---------------------------------------------------------------------
-# Health
+# Endpoints
 # ---------------------------------------------------------------------
 
 @app.get("/health")
@@ -120,7 +191,7 @@ def run_fetch(form_id: str = DEFAULT_FORM_ID, max_pages: int = 9999):
 
 
 # ---------------------------------------------------------------------
-# Deduplicate all local snapshots by latest email submission
+# Deduplicate
 # ---------------------------------------------------------------------
 
 @app.post("/run-dedupe")
@@ -150,20 +221,20 @@ def run_dedupe():
             f.write(json.dumps(s) + "\n")
 
     logger.info("✅ Deduplicated %s total → %s unique emails", total, len(latest))
-    return {"input_submissions": total, "unique_emails": len(latest), "output_file": out_path}
+    return {
+        "input_submissions": total,
+        "unique_emails": len(latest),
+        "output_file": out_path,
+    }
 
 
 # ---------------------------------------------------------------------
-# Recovery runner – always updates both consent fields + logs
+# Recovery (resumable, background-safe)
 # ---------------------------------------------------------------------
 
 @app.post("/run-recover")
-def run_recover(batch_size: int = 1000):
-    """
-    Apply consent updates for all deduped submissions.
-    Always writes both checkbox values exactly as submitted.
-    Resumable: tracks progress in cursor.txt.
-    """
+def run_recover(batch_size: int = 100):
+    """Apply consent updates for all deduped submissions."""
     deduped_path = "data/deduped_submissions.jsonl"
     if not os.path.exists(deduped_path):
         raise HTTPException(status_code=404, detail="deduped_submissions.jsonl not found")
@@ -171,10 +242,10 @@ def run_recover(batch_size: int = 1000):
     with open(deduped_path, "r", encoding="utf-8") as f:
         subs = [json.loads(line) for line in f]
 
-    cursor_file = "data/cursor.txt"
-    start_idx = int(open(cursor_file).read().strip() or 0) if os.path.exists(cursor_file) else 0
-
+    start_idx = int(open(CURSOR_FILE).read().strip() or 0) if os.path.exists(CURSOR_FILE) else 0
     success, errors = 0, 0
+
+    update_job_status(status="running", current=start_idx, total=len(subs))
 
     for i, s in enumerate(subs[start_idx:], start=start_idx):
         try:
@@ -186,13 +257,18 @@ def run_recover(batch_size: int = 1000):
                 logger.info("🚫 [%s/%s] No HubSpot contact for %s", i + 1, len(subs), email)
                 continue
 
-            # Always send both values exactly as submitted (default to "Not Checked")
             payload = {
                 "properties": {
                     "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information":
-                        boxes.get("select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information", "Not Checked"),
+                        boxes.get(
+                            "select_to_receive_information_from_vrm_mortgage_services_regarding_events_and_property_information",
+                            "Not Checked",
+                        ),
                     "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy":
-                        boxes.get("i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy", "Not Checked"),
+                        boxes.get(
+                            "i_agree_to_vrm_mortgage_services_s_terms_of_service_and_privacy_policy",
+                            "Not Checked",
+                        ),
                 }
             }
 
@@ -217,69 +293,65 @@ def run_recover(batch_size: int = 1000):
                 len(subs),
                 email,
                 json.dumps(boxes, indent=2),
-                json.dumps(payload['properties'], indent=2),
+                json.dumps(payload["properties"], indent=2),
             )
 
         except Exception as e:
             logger.error("⚠️ Error on record %s: %s", i, e)
             errors += 1
 
-        if (i + 1) % batch_size == 0:
-            with open(cursor_file, "w") as f:
+        # Auto-save every 100
+        if (i + 1) % 100 == 0:
+            with open(CURSOR_FILE, "w") as f:
                 f.write(str(i + 1))
+            update_job_status(
+                status="running", current=i + 1, total=len(subs), success=success, errors=errors
+            )
             logger.info("💾 Progress saved (%s processed)", i + 1)
 
         time.sleep(0.6)
 
-    with open(cursor_file, "w") as f:
+    with open(CURSOR_FILE, "w") as f:
         f.write(str(len(subs)))
-
+    update_job_status(status="complete", success=success, errors=errors, total=len(subs))
     logger.info("🏁 Recovery completed — Success: %s, Errors: %s", success, errors)
+
     return {"success": success, "errors": errors, "total": len(subs)}
 
 
-# ---------------------------------------------------------------------
-# Generate a simple summary report
-# ---------------------------------------------------------------------
+@app.post("/trigger-recover")
+def trigger_recover(batch_size: int = 100):
+    """Kick off recovery in a background thread so browser can disconnect safely."""
+    def background_job():
+        update_job_status(status="starting", started_at=datetime.utcnow().isoformat())
+        try:
+            run_recover(batch_size=batch_size)
+        except Exception as e:
+            update_job_status(status="error", message=str(e))
+            logger.error(f"Background job failed: {e}")
+
+    threading.Thread(target=background_job, daemon=True).start()
+    return {"status": "started", "message": "Recovery running in background"}
+
 
 @app.get("/run-report")
 def run_report():
-    """Summarize progress and show final metrics."""
-    cursor = 0
-    if os.path.exists("data/cursor.txt"):
-        cursor = int(open("data/cursor.txt").read().strip() or 0)
-    deduped = sum(1 for _ in open("data/deduped_submissions.jsonl", "r")) if os.path.exists("data/deduped_submissions.jsonl") else 0
-    return {"records_total": deduped, "records_processed": cursor, "records_remaining": max(deduped - cursor, 0)}
-
-
-# ---------------------------------------------------------------------
-# Shared utilities
-# ---------------------------------------------------------------------
-
-def parse_submission(s: Dict) -> Tuple[Optional[str], Dict[str, str]]:
-    vals = s.get("values", [])
-    email, consent = None, {}
-    for v in vals:
-        name, val = v.get("name"), v.get("value")
-        if not isinstance(name, str) or not isinstance(val, str):
-            continue
-        if name == "email":
-            email = val.strip()
-        elif name in CHECKBOX_PROPERTIES and val.strip() in ("Checked", "Not Checked"):
-            consent[name] = val.strip()
-    return email, consent
-
-
-def find_contact_by_email(email: str) -> Optional[str]:
-    payload = {
-        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
-        "limit": 1,
-        "properties": ["email"],
+    """Summarize progress and show job metrics."""
+    job = read_job_status()
+    cursor = int(open(CURSOR_FILE).read().strip() or 0) if os.path.exists(CURSOR_FILE) else 0
+    deduped = (
+        sum(1 for _ in open("data/deduped_submissions.jsonl", "r"))
+        if os.path.exists("data/deduped_submissions.jsonl")
+        else 0
+    )
+    pct = round(cursor / deduped * 100, 2) if deduped else 0
+    return {
+        "records_total": deduped,
+        "records_processed": cursor,
+        "records_remaining": max(deduped - cursor, 0),
+        "percent_complete": pct,
+        "job_status": job,
     }
-    r = requests.post(f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search", headers=hubspot_headers(), json=payload, timeout=30)
-    r.raise_for_status()
-    res = r.json().get("results", [])
-    return res[0].get("id") if res else None
 
 
 # ---------------------------------------------------------------------
@@ -288,4 +360,5 @@ def find_contact_by_email(email: str) -> Optional[str]:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
