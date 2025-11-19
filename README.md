@@ -1,4 +1,4 @@
-# HubSpot Registration Form Recovery Service
+# HubSpot Any Form Recovery Service
 
 This FastAPI service fetches historical HubSpot form submissions and replays the field values back to CRM contacts. It was built to rescue submissions from multiple legacy marketing forms where contacts failed to receive the proper lifecycle or consent updates.
 
