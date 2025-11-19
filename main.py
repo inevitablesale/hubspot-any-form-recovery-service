@@ -16,7 +16,7 @@ load_dotenv()
 # App Metadata
 # ---------------------------------------------------------------------------
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # ---------------------------------------------------------------------------
 # Environment Variables
@@ -77,9 +77,7 @@ def require_auth(authorization: str = Header(None)) -> bool:
         scheme, token = authorization.split(" ", 1)
     except ValueError:
         log_json("auth_invalid_format", header=authorization)
-        raise HTTPException(
-            status_code=403, detail="Invalid Authorization header format."
-        )
+        raise HTTPException(status_code=403, detail="Invalid Authorization header format.")
 
     if scheme.lower() != "bearer" or token != APP_AUTH_TOKEN:
         log_json("auth_invalid_token", provided=token)
@@ -107,38 +105,37 @@ def hubspot_headers() -> Dict[str, str]:
 
 
 def apply_rate_limit_heuristics(resp_headers: Dict[str, Any]) -> None:
-    """Simple backoff when approaching HubSpot rate limits."""
+    """Dynamic slowdown when HubSpot warns of rate limits."""
     remaining = resp_headers.get("X-HubSpot-RateLimit-Remaining")
-    if remaining is not None:
-        try:
-            remaining_int = int(remaining)
-            if remaining_int < 5:
-                time.sleep(4)
-            elif remaining_int < 10:
-                time.sleep(2)
-        except Exception:
-            # If header isn't an int, just ignore
-            pass
-
     retry_after = resp_headers.get("Retry-After")
+
     if retry_after:
         try:
             time.sleep(int(retry_after))
-        except Exception:
+        except:
             pass
 
-    # Small general delay to be gentle on the API
+    try:
+        if remaining is not None:
+            r = int(remaining)
+            if r < 5:
+                time.sleep(4)
+            elif r < 10:
+                time.sleep(2)
+    except:
+        pass
+
+    # small jitter for safety
     time.sleep(0.15)
 
 
 def fetch_form_submissions(form_id: str, after: Optional[str] = None) -> Dict[str, Any]:
     """
-    Fetch submissions for a given HubSpot form using the form-integrations API.
-
-    This endpoint works for regular HubSpot forms (the IDs you see in the UI):
-      /form-integrations/v1/submissions/forms/{formId}
+    Fetch submissions using the form-integrations API.
+    HubSpot returns inconsistent paging formats, so we normalize it.
     """
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
+
     params: Dict[str, Any] = {"limit": 1000}
     if after:
         params["after"] = after
@@ -155,20 +152,40 @@ def fetch_form_submissions(form_id: str, after: Optional[str] = None) -> Dict[st
             form=form_id,
             status=status,
             error=str(exc),
+            url=url,
         )
-        # If a form was deleted or never existed, just log and return no results
-        if status == 404:
-            return {"results": [], "paging": {}}
+        if status in (400, 404):
+            # treat as empty
+            return {"results": [], "after": None}
         raise
 
     data = resp.json()
+    results = data.get("results", [])
+
+    # Normalize after token across all HubSpot weird formats
+    next_after = None
+
+    # structure #1 { "paging": { "next": { "after": "abc" } } }
+    if isinstance(data.get("paging"), dict):
+        next_after = data.get("paging", {}).get("next", {}).get("after")
+
+    # structure #2 { "next": { "after": "abc" } }
+    if not next_after and isinstance(data.get("next"), dict):
+        next_after = data.get("next", {}).get("after")
+
+    # structure #3 { "next": "abc" }
+    if not next_after and isinstance(data.get("next"), str):
+        next_after = data.get("next")
+
     log_json(
         "form_page_fetched",
         form=form_id,
         after=after,
-        results_count=len(data.get("results", [])),
+        next_after=next_after,
+        results_count=len(results),
     )
-    return data
+
+    return {"results": results, "after": next_after}
 
 
 def get_contact_by_email(email: str) -> Optional[Dict[str, Any]]:
@@ -185,17 +202,12 @@ def get_contact_by_email(email: str) -> Optional[Dict[str, Any]]:
     resp.raise_for_status()
     data = resp.json()
 
-    if "results" in data and len(data["results"]) > 0:
-        return data["results"][0]
-
-    return None
+    return data["results"][0] if data.get("results") else None
 
 
 def update_contact(contact_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{contact_id}"
-    resp = requests.patch(
-        url, headers=hubspot_headers(), json={"properties": properties}
-    )
+    resp = requests.patch(url, headers=hubspot_headers(), json={"properties": properties})
     resp.raise_for_status()
     return resp.json()
 
@@ -208,17 +220,16 @@ def update_contact(contact_id: str, properties: Dict[str, Any]) -> Dict[str, Any
 def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> None:
     submitted_values = submission.get("values", [])
 
-    email: Optional[str] = None
+    email = None
     submission_fields: Dict[str, Any] = {}
 
-    for field in submitted_values:
-        field_name = field.get("name")
-        field_value = field.get("value")
-        if field_name is None:
-            continue
-        submission_fields[field_name] = field_value
-        if field_name == "email":
-            email = field_value
+    for f in submitted_values:
+        name = f.get("name")
+        val = f.get("value")
+        if name:
+            submission_fields[name] = val
+        if name == "email":
+            email = val
 
     if not email:
         log_json("skip_no_email", form=form_id)
@@ -230,20 +241,19 @@ def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> N
         return
 
     contact_id = contact["id"]
-    mapped_fields = FORM_PROPERTY_MAP.get(form_id, {})
+    existing_props = contact.get("properties", {})
+
+    map_for_form = FORM_PROPERTY_MAP.get(form_id, {})
     updates: Dict[str, Any] = {}
 
-    for form_field, hubspot_property in mapped_fields.items():
-        submission_value = submission_fields.get(form_field)
-        if submission_value is None:
+    for form_field, hubspot_prop in map_for_form.items():
+        val = submission_fields.get(form_field)
+        if val is None:
             continue
-
-        existing_value = contact.get("properties", {}).get(hubspot_property)
-        if existing_value not in (None, "", " "):
-            # Don't overwrite existing data
+        existing_val = existing_props.get(hubspot_prop)
+        if existing_val not in (None, "", " "):
             continue
-
-        updates[hubspot_property] = submission_value
+        updates[hubspot_prop] = val
 
     log_json(
         "submission_processed",
@@ -282,25 +292,23 @@ def run_recovery(mode: str) -> None:
     for form_id in FORM_PROPERTY_MAP.keys():
         log_json("start_form", form=form_id, requested_mode=mode, mode=effective_mode)
 
-        after: Optional[str] = None
+        after = None
 
         while True:
-            page_data = fetch_form_submissions(form_id, after=after)
-            results = page_data.get("results", [])
+            page = fetch_form_submissions(form_id, after)
+            results = page.get("results", [])
+            next_after = page.get("after")
 
             if not results:
-                # No submissions or form not found / empty
                 break
 
             for submission in results:
                 process_submission(form_id, submission, effective_mode)
 
-            page = page_data.get("paging", {})
-            next_page = page.get("next") if page else None
-            if not next_page or "after" not in next_page:
+            if not next_after:
                 break
 
-            after = next_page["after"]
+            after = next_after
 
         log_json("end_form", form=form_id, mode=effective_mode)
 
@@ -314,7 +322,6 @@ app = FastAPI(title="HubSpot Form Submission Recovery Service", version=APP_VERS
 
 @app.get("/health")
 def health():
-    """Unauthenticated health check for Render and uptime monitors."""
     return {
         "status": "ok",
         "version": APP_VERSION,
@@ -351,16 +358,10 @@ def unkill(_: bool = Depends(require_auth)):
 
 
 @app.post("/run-all")
-def run_all(
-    body: Dict[str, Any] = Body(...),
-    _: bool = Depends(require_auth),
-):
+def run_all(body: Dict[str, Any] = Body(...), _: bool = Depends(require_auth)):
     if KILLED:
         log_json("run_blocked_killed")
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Kill switch active — execution blocked."},
-        )
+        return JSONResponse(status_code=403, content={"error": "Kill switch active — execution blocked."})
 
     mode = body.get("mode", "smoke")
     if mode not in ("smoke", "write"):
@@ -368,4 +369,5 @@ def run_all(
 
     log_json("run_all_start", mode=mode, dry_run_force=DRY_RUN_FORCE)
     run_recovery(mode)
+
     return {"status": "complete", "mode": "smoke" if DRY_RUN_FORCE else mode}
