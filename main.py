@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, Optional
 
 import requests
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
@@ -20,11 +20,14 @@ HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
 FORM_PROPERTY_MAP_RAW = os.getenv("HUBSPOT_FORM_PROPERTY_MAP")
 HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
 DRY_RUN_FORCE = os.getenv("DRY_RUN_FORCE", "false").lower() == "true"
+APP_AUTH_TOKEN = os.getenv("APP_AUTH_TOKEN")
 
 if not HUBSPOT_TOKEN:
     raise Exception("HUBSPOT_PRIVATE_APP_TOKEN is required.")
 if not FORM_PROPERTY_MAP_RAW:
     raise Exception("HUBSPOT_FORM_PROPERTY_MAP is required.")
+if not APP_AUTH_TOKEN:
+    raise Exception("APP_AUTH_TOKEN is required for API security.")
 
 FORM_PROPERTY_MAP: Dict[str, Dict[str, str]] = json.loads(FORM_PROPERTY_MAP_RAW)
 
@@ -47,6 +50,36 @@ def log_json(event: str, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Auth Helper
+# ---------------------------------------------------------------------------
+
+def require_auth(authorization: str = Header(None)):
+    """Validates Authorization: Bearer <token> header."""
+    if not authorization:
+        log_json("auth_missing")
+        raise HTTPException(status_code=403, detail="Missing Authorization header.")
+
+    try:
+        scheme, token = authorization.split(" ")
+    except ValueError:
+        log_json("auth_invalid_format", header=authorization)
+        raise HTTPException(status_code=403, detail="Invalid Authorization header format.")
+
+    if scheme.lower() != "bearer" or token != APP_AUTH_TOKEN:
+        log_json("auth_invalid_token", provided=token)
+        raise HTTPException(status_code=403, detail="Invalid authentication token.")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Kill Switch (in-memory)
+# ---------------------------------------------------------------------------
+
+KILLED = False
+
+
+# ---------------------------------------------------------------------------
 # HubSpot API Helpers
 # ---------------------------------------------------------------------------
 
@@ -57,7 +90,6 @@ def hubspot_headers():
     }
 
 
-# Fetch form submissions w/ pagination
 def fetch_form_submissions(form_id: str, after: Optional[str] = None):
     url = f"{HUBSPOT_BASE_URL}/marketing/v3/forms/{form_id}/submissions"
     params = {"limit": 100}
@@ -101,16 +133,6 @@ def update_contact(contact_id: str, properties: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 
 def apply_rate_limit_heuristics(resp_headers):
-    """
-    Uses HubSpot response headers to throttle calls safely.
-
-    Uses the 4 heuristic rules you approved:
-    1. If remaining under 10 → sleep 2 seconds
-    2. If remaining under 5  → sleep 4 seconds
-    3. If "too many requests" → sleep 10 seconds
-    4. Add a tiny jitter (0.1–0.3s) for smoothing burst patterns
-    """
-
     remaining = resp_headers.get("X-HubSpot-RateLimit-Remaining")
     if remaining is not None:
         try:
@@ -125,21 +147,16 @@ def apply_rate_limit_heuristics(resp_headers):
     if resp_headers.get("Retry-After"):
         time.sleep(int(resp_headers["Retry-After"]))
 
-    time.sleep(0.15)  # jitter
+    time.sleep(0.15)
 
 
 # ---------------------------------------------------------------------------
-# Process One Submission (core logic)
+# Process One Submission
 # ---------------------------------------------------------------------------
 
-def process_submission(
-    form_id: str,
-    submission: Dict[str, Any],
-    mode: str
-):
+def process_submission(form_id: str, submission: Dict[str, Any], mode: str):
     submitted_values = submission.get("values", [])
 
-    # Extract email from submission
     email = None
     submission_fields = {}
 
@@ -150,40 +167,31 @@ def process_submission(
         if field_name == "email":
             email = field_value
 
-    # EMAIL REQUIRED
     if not email:
-        log_json("skip_no_email", form=form_id, submissionId=submission.get("submittedAt"))
+        log_json("skip_no_email", form=form_id)
         return
 
-    # Find contact once
     contact = get_contact_by_email(email)
     if not contact:
-        log_json("contact_not_found", form=form_id, email=email)
+        log_json("contact_not_found", email=email)
         return
 
     contact_id = contact["id"]
-
-    # Start building changes
     mapped_fields = FORM_PROPERTY_MAP.get(form_id, {})
     updates = {}
 
-    # Loop mapped fields ONLY
     for form_field, hubspot_property in mapped_fields.items():
         submission_value = submission_fields.get(form_field)
 
-        # Per-field rule 1: Must be in submission
         if submission_value is None:
             continue
 
-        # Per-field rule 2: Must be mapped (guaranteed)
-        # Per-field rule 3: Don't overwrite existing values
         existing_value = contact.get("properties", {}).get(hubspot_property)
         if existing_value not in (None, "", " "):
             continue
 
         updates[hubspot_property] = submission_value
 
-    # Emit summary log
     log_json(
         "submission_processed",
         form=form_id,
@@ -194,9 +202,8 @@ def process_submission(
         mode=mode
     )
 
-    # Dry-Run Override (env-level)
     if DRY_RUN_FORCE:
-        log_json("dry_run_forced", form=form_id, email=email)
+        log_json("dry_run_forced", email=email)
         return
 
     if mode == "write" and updates:
@@ -250,14 +257,54 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
+    """Unauthenticated for Render health checks."""
     return {"status": "ok", "forms": list(FORM_PROPERTY_MAP.keys())}
 
 
+@app.get("/status")
+def status(authorization: str = Header(None)):
+    require_auth(authorization)
+    return {
+        "status": "alive" if not KILLED else "killed",
+        "kill_switch": KILLED,
+        "dry_run_force": DRY_RUN_FORCE,
+        "forms_loaded": list(FORM_PROPERTY_MAP.keys())
+    }
+
+
+@app.post("/kill")
+def kill(authorization: str = Header(None)):
+    require_auth(authorization)
+    global KILLED
+    KILLED = True
+    log_json("kill_switch_activated")
+    return {"status": "killed"}
+
+
+@app.post("/unkill")
+def unkill(authorization: str = Header(None)):
+    require_auth(authorization)
+    global KILLED
+    KILLED = False
+    log_json("kill_switch_deactivated")
+    return {"status": "alive"}
+
+
 @app.post("/run-all")
-def run_all(body: Dict[str, Any] = Body(...)):
+def run_all(body: Dict[str, Any] = Body(...), authorization: str = Header(None)):
+    require_auth(authorization)
+
+    if KILLED:
+        log_json("run_blocked_killed")
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."}
+        )
+
     mode = body.get("mode", "smoke")
     if mode not in ("smoke", "write"):
         return JSONResponse(status_code=400, content={"error": "Invalid mode"})
 
+    log_json("run_all_start", mode=mode)
     run_recovery(mode)
     return {"status": "complete", "mode": mode}
