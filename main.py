@@ -3,7 +3,7 @@ import json
 import time
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import requests
 from fastapi import FastAPI, Body, Header, HTTPException, Depends
@@ -16,7 +16,7 @@ load_dotenv()
 # App Metadata
 # ---------------------------------------------------------------------------
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # ---------------------------------------------------------------------------
 # Environment Variables
@@ -77,7 +77,10 @@ def require_auth(authorization: str = Header(None)) -> bool:
         scheme, token = authorization.split(" ", 1)
     except ValueError:
         log_json("auth_invalid_format", header=authorization)
-        raise HTTPException(status_code=403, detail="Invalid Authorization header format.")
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid Authorization header format."
+        )
 
     if scheme.lower() != "bearer" or token != APP_AUTH_TOKEN:
         log_json("auth_invalid_token", provided=token)
@@ -112,7 +115,7 @@ def apply_rate_limit_heuristics(resp_headers: Dict[str, Any]) -> None:
     if retry_after:
         try:
             time.sleep(int(retry_after))
-        except:
+        except Exception:
             pass
 
     try:
@@ -122,21 +125,22 @@ def apply_rate_limit_heuristics(resp_headers: Dict[str, Any]) -> None:
                 time.sleep(4)
             elif r < 10:
                 time.sleep(2)
-    except:
+    except Exception:
         pass
 
     # small jitter for safety
     time.sleep(0.15)
 
 
-def fetch_form_submissions(form_id: str, after: Optional[str] = None) -> Dict[str, Any]:
+def fetch_form_submissions(form_id: str, after: Optional[str] = None,
+                           limit: int = 1000) -> Dict[str, Any]:
     """
     Fetch submissions using the form-integrations API.
     HubSpot returns inconsistent paging formats, so we normalize it.
     """
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
 
-    params: Dict[str, Any] = {"limit": 1000}
+    params: Dict[str, Any] = {"limit": limit}
     if after:
         params["after"] = after
 
@@ -207,19 +211,24 @@ def get_contact_by_email(email: str) -> Optional[Dict[str, Any]]:
 
 def update_contact(contact_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{contact_id}"
-    resp = requests.patch(url, headers=hubspot_headers(), json={"properties": properties})
+    resp = requests.patch(
+        url,
+        headers=hubspot_headers(),
+        json={"properties": properties},
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 # ---------------------------------------------------------------------------
-# Process One Submission
+# Core Helpers
 # ---------------------------------------------------------------------------
 
 
-def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> None:
+def extract_submission_email_and_fields(
+    submission: Dict[str, Any]
+) -> (Optional[str], Dict[str, Any]):
     submitted_values = submission.get("values", [])
-
     email = None
     submission_fields: Dict[str, Any] = {}
 
@@ -231,17 +240,16 @@ def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> N
         if name == "email":
             email = val
 
-    if not email:
-        log_json("skip_no_email", form=form_id)
-        return
+    return email, submission_fields
 
-    contact = get_contact_by_email(email)
-    if not contact:
-        log_json("contact_not_found", email=email, form=form_id)
-        return
 
+def compute_updates_for_submission(
+    form_id: str,
+    submission_fields: Dict[str, Any],
+    contact: Dict[str, Any]
+) -> Dict[str, Any]:
     contact_id = contact["id"]
-    existing_props = contact.get("properties", {})
+    existing_props = contact.get("properties", {}) or {}
 
     map_for_form = FORM_PROPERTY_MAP.get(form_id, {})
     updates: Dict[str, Any] = {}
@@ -254,6 +262,29 @@ def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> N
         if existing_val not in (None, "", " "):
             continue
         updates[hubspot_prop] = val
+
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# Process One Submission
+# ---------------------------------------------------------------------------
+
+
+def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> None:
+    email, submission_fields = extract_submission_email_and_fields(submission)
+
+    if not email:
+        log_json("skip_no_email", form=form_id)
+        return
+
+    contact = get_contact_by_email(email)
+    if not contact:
+        log_json("contact_not_found", email=email, form=form_id)
+        return
+
+    contact_id = contact["id"]
+    updates = compute_updates_for_submission(form_id, submission_fields, contact)
 
     log_json(
         "submission_processed",
@@ -313,11 +344,217 @@ def run_recovery(mode: str) -> None:
         log_json("end_form", form=form_id, mode=effective_mode)
 
 
+def run_recovery_for_form(
+    form_id: str,
+    mode: str,
+    limit: Optional[int] = None,
+    start_after: Optional[str] = None,
+    filter_email: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Core runner for a single form with optional limit, paging, and email filter.
+    Returns summary info including last 'after' token for chaining.
+    """
+    effective_mode = "smoke" if DRY_RUN_FORCE else mode
+    processed_count = 0
+    matches_count = 0
+
+    after = start_after
+    last_after = None
+
+    log_json(
+        "run_single_form_start",
+        form=form_id,
+        requested_mode=mode,
+        mode=effective_mode,
+        limit=limit,
+        start_after=start_after,
+        filter_email=filter_email,
+    )
+
+    while True:
+        page = fetch_form_submissions(form_id, after)
+        results = page.get("results", [])
+        next_after = page.get("after")
+
+        if not results:
+            break
+
+        for submission in results:
+            processed_count += 1
+
+            email, _ = extract_submission_email_and_fields(submission)
+            if filter_email:
+                if not email or email.lower() != filter_email.lower():
+                    continue
+                matches_count += 1
+
+            process_submission(form_id, submission, effective_mode)
+
+            if limit is not None and processed_count >= limit:
+                last_after = next_after
+                log_json(
+                    "run_single_form_limit_reached",
+                    form=form_id,
+                    processed_count=processed_count,
+                    limit=limit,
+                    next_after=next_after,
+                )
+                log_json(
+                    "run_single_form_complete",
+                    form=form_id,
+                    mode=effective_mode,
+                    processed_count=processed_count,
+                    matches_count=matches_count,
+                    last_after=last_after,
+                )
+                return {
+                    "status": "complete",
+                    "form": form_id,
+                    "mode": effective_mode,
+                    "processed_count": processed_count,
+                    "matches_count": matches_count,
+                    "next_after": last_after,
+                }
+
+        if not next_after:
+            last_after = None
+            break
+
+        after = next_after
+        last_after = next_after
+
+    log_json(
+        "run_single_form_complete",
+        form=form_id,
+        mode=effective_mode,
+        processed_count=processed_count,
+        matches_count=matches_count,
+        last_after=last_after,
+    )
+
+    return {
+        "status": "complete",
+        "form": form_id,
+        "mode": effective_mode,
+        "processed_count": processed_count,
+        "matches_count": matches_count,
+        "next_after": last_after,
+    }
+
+
+def preview_recovery_for_form(
+    form_id: str,
+    limit: Optional[int] = None,
+    start_after: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Preview mode: returns a list of potential updates without writing anything.
+    Ignores DRY_RUN_FORCE and always behaves as a read-only dry-run.
+    """
+    processed_count = 0
+    preview_items: List[Dict[str, Any]] = []
+
+    after = start_after
+    last_after = None
+
+    log_json(
+        "preview_form_start",
+        form=form_id,
+        limit=limit,
+        start_after=start_after,
+    )
+
+    while True:
+        page = fetch_form_submissions(form_id, after)
+        results = page.get("results", [])
+        next_after = page.get("after")
+
+        if not results:
+            break
+
+        for submission in results:
+            processed_count += 1
+
+            email, submission_fields = extract_submission_email_and_fields(submission)
+            if not email:
+                continue
+
+            contact = get_contact_by_email(email)
+            if not contact:
+                continue
+
+            contact_id = contact["id"]
+            updates = compute_updates_for_submission(form_id, submission_fields, contact)
+
+            if updates:
+                preview_items.append(
+                    {
+                        "email": email,
+                        "contact_id": contact_id,
+                        "updates_count": len(updates),
+                        "updates": updates,
+                    }
+                )
+
+            if limit is not None and processed_count >= limit:
+                last_after = next_after
+                log_json(
+                    "preview_form_limit_reached",
+                    form=form_id,
+                    processed_count=processed_count,
+                    limit=limit,
+                    next_after=next_after,
+                )
+                log_json(
+                    "preview_form_complete",
+                    form=form_id,
+                    processed_count=processed_count,
+                    last_after=last_after,
+                    preview_count=len(preview_items),
+                )
+                return {
+                    "status": "complete",
+                    "form": form_id,
+                    "processed_count": processed_count,
+                    "preview_count": len(preview_items),
+                    "next_after": last_after,
+                    "items": preview_items,
+                }
+
+        if not next_after:
+            last_after = None
+            break
+
+        after = next_after
+        last_after = next_after
+
+    log_json(
+        "preview_form_complete",
+        form=form_id,
+        processed_count=processed_count,
+        last_after=last_after,
+        preview_count=len(preview_items),
+    )
+
+    return {
+        "status": "complete",
+        "form": form_id,
+        "processed_count": processed_count,
+        "preview_count": len(preview_items),
+        "next_after": last_after,
+        "items": preview_items,
+    }
+
+
 # ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="HubSpot Form Submission Recovery Service", version=APP_VERSION)
+app = FastAPI(
+    title="HubSpot Form Submission Recovery Service",
+    version=APP_VERSION,
+)
 
 
 @app.get("/health")
@@ -361,13 +598,179 @@ def unkill(_: bool = Depends(require_auth)):
 def run_all(body: Dict[str, Any] = Body(...), _: bool = Depends(require_auth)):
     if KILLED:
         log_json("run_blocked_killed")
-        return JSONResponse(status_code=403, content={"error": "Kill switch active — execution blocked."})
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."},
+        )
 
     mode = body.get("mode", "smoke")
     if mode not in ("smoke", "write"):
-        return JSONResponse(status_code=400, content={"error": "Invalid mode"})
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid mode"},
+        )
 
     log_json("run_all_start", mode=mode, dry_run_force=DRY_RUN_FORCE)
     run_recovery(mode)
 
-    return {"status": "complete", "mode": "smoke" if DRY_RUN_FORCE else mode}
+    return {
+        "status": "complete",
+        "mode": "smoke" if DRY_RUN_FORCE else mode,
+    }
+
+
+@app.post("/run-form/{form_id}")
+def run_form(
+    form_id: str,
+    body: Dict[str, Any] = Body(...),
+    limit: Optional[int] = None,
+    _: bool = Depends(require_auth),
+):
+    if KILLED:
+        log_json("run_blocked_killed", form=form_id)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."},
+        )
+
+    if form_id not in FORM_PROPERTY_MAP:
+        log_json("form_not_found", form=form_id)
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Form '{form_id}' not found in HUBSPOT_FORM_PROPERTY_MAP."},
+        )
+
+    mode = body.get("mode", "smoke")
+    if mode not in ("smoke", "write"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid mode. Use 'smoke' or 'write'."},
+        )
+
+    summary = run_recovery_for_form(
+        form_id=form_id,
+        mode=mode,
+        limit=limit,
+        start_after=None,
+        filter_email=None,
+    )
+    return summary
+
+
+@app.post("/run-form/{form_id}/email/{email}")
+def run_form_for_email(
+    form_id: str,
+    email: str,
+    body: Dict[str, Any] = Body(...),
+    _: bool = Depends(require_auth),
+):
+    """
+    Run recovery for a single contact (by email) within a form.
+    Respects DRY_RUN_FORCE.
+    """
+    if KILLED:
+        log_json("run_blocked_killed", form=form_id, email=email)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."},
+        )
+
+    if form_id not in FORM_PROPERTY_MAP:
+        log_json("form_not_found", form=form_id)
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Form '{form_id}' not found in HUBSPOT_FORM_PROPERTY_MAP."},
+        )
+
+    mode = body.get("mode", "smoke")
+    if mode not in ("smoke", "write"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid mode. Use 'smoke' or 'write'."},
+        )
+
+    # We don't apply 'limit' here; we process all submissions for this email.
+    summary = run_recovery_for_form(
+        form_id=form_id,
+        mode=mode,
+        limit=None,
+        start_after=None,
+        filter_email=email,
+    )
+    return summary
+
+
+@app.get("/preview-form/{form_id}")
+def preview_form(
+    form_id: str,
+    limit: Optional[int] = None,
+    start_after: Optional[str] = None,
+    _: bool = Depends(require_auth),
+):
+    """
+    Preview what WOULD be updated for a given form without writing anything.
+    Ignores DRY_RUN_FORCE and always behaves as a safe dry-run.
+    """
+    if KILLED:
+        log_json("preview_blocked_killed", form=form_id)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."},
+        )
+
+    if form_id not in FORM_PROPERTY_MAP:
+        log_json("form_not_found", form=form_id)
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Form '{form_id}' not found in HUBSPOT_FORM_PROPERTY_MAP."},
+        )
+
+    summary = preview_recovery_for_form(
+        form_id=form_id,
+        limit=limit,
+        start_after=start_after,
+    )
+    return summary
+
+
+@app.post("/run-form/{form_id}/batch")
+def run_form_batch(
+    form_id: str,
+    body: Dict[str, Any] = Body(...),
+    start_after: Optional[str] = None,
+    limit: Optional[int] = None,
+    _: bool = Depends(require_auth),
+):
+    """
+    Run a batch for a single form starting from a specific 'after' token.
+    Useful for manual paging through very large historical datasets.
+    """
+    if KILLED:
+        log_json("run_blocked_killed", form=form_id)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Kill switch active — execution blocked."},
+        )
+
+    if form_id not in FORM_PROPERTY_MAP:
+        log_json("form_not_found", form=form_id)
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Form '{form_id}' not found in HUBSPOT_FORM_PROPERTY_MAP."},
+        )
+
+    mode = body.get("mode", "smoke")
+    if mode not in ("smoke", "write"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid mode. Use 'smoke' or 'write'."},
+        )
+
+    summary = run_recovery_for_form(
+        form_id=form_id,
+        mode=mode,
+        limit=limit,
+        start_after=start_after,
+        filter_email=None,
+    )
+    return summary
