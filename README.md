@@ -1,39 +1,52 @@
 # HubSpot Registration Form Recovery Service
 
-This project provides a small FastAPI service that repairs consent preferences for the `#registerForm` HubSpot form. When the `/run`
-endpoint is triggered (for example by a webhook or scheduled job), the service downloads the most recent form submissions, extracts
-the consent checkbox values, and updates existing HubSpot contacts. It is intended for one-off or ad-hoc recovery runs that you can
-host on [Render](https://render.com/) or any container-friendly platform.
+This FastAPI service fetches historical HubSpot form submissions and replays the field values back to CRM contacts. It was built to rescue submissions from multiple legacy marketing forms where contacts failed to receive the proper lifecycle or consent updates.
+
+The worker only performs actions when you call the `/run-all` webhook, making it ideal for one-off data repair jobs that you can host on [Render](https://render.com/), Fly.io, or any platform that supports containers and cron jobs.
 
 ---
 
 ## Features
 
-- **On-demand execution** – Runs only when the `/run` webhook is invoked; no Zapier dependencies.
-- **Form submission recovery** – Fetches submissions from HubSpot in configurable batches (default 500) and re-applies the
-  consent values to the matching contacts.
-- **Contact safety** – Updates only the `---` and `---` properties when a matching
-  email is found.
-- **Structured responses** – Returns a JSON summary detailing how many submissions were processed, updated, skipped, or produced
-  errors.
+- **Multi-form property mapping** – Supply a JSON map of `formId → {formField: hubspotProperty}` via the `HUBSPOT_FORM_PROPERTY_MAP` environment variable and the service will iterate each form automatically.
+- **Two execution modes** – `smoke` mode reads submissions, finds contacts, and logs the data without performing any CRM updates. `write` mode repeats the smoke flow but only patches the mapped properties that exist in each submission.
+- **Contact safety** – Updates are scoped to the mapped fields and require an exact email match. Missing contacts are skipped and noted in the logs.
+- **Structured logging** – Stream + rotating-file logging make it easy to watch progress locally or when deployed to a host like Render.
+- **Health endpoint** – `/health` returns the configured form IDs so you can verify the service booted with the expected configuration.
 
 ---
 
-## Prerequisites
+## Prerequisites & Configuration
 
 - Python 3.10+
-- HubSpot private app token with permission to read form submissions and update contacts
-- HubSpot form ID `----`
+- HubSpot private app token that can read form submissions and update contacts
 
-Set the following environment variables before running the service:
+| Variable | Required | Description |
+| --- | --- | --- |
+| `HUBSPOT_PRIVATE_APP_TOKEN` | ✅ | Private app token used for all HubSpot API calls. |
+| `HUBSPOT_FORM_PROPERTY_MAP` | ✅ | JSON string that defines which form fields map to which HubSpot contact properties. |
+| `HUBSPOT_BASE_URL` | ❌ | Override HubSpot's base URL (defaults to `https://api.hubapi.com`). |
+| `LOG_FILE` | ❌ | Custom log file path for the rotating file handler (defaults to `recovery.log`). |
+| `PORT` | ❌ | Port used when running `uvicorn` locally (defaults to `8000`). |
 
-| Variable | Description |
-| --- | --- |
-| `HUBSPOT_PRIVATE_APP_TOKEN` | Required. HubSpot private app token used for all API requests. |
-| `HUBSPOT_FORM_ID` | Optional. Defaults to `---`. |
-| `HUBSPOT_BASE_URL` | Optional. Override HubSpot base URL for testing (default `https://api.hubapi.com`). |
+Example `HUBSPOT_FORM_PROPERTY_MAP` payload:
 
-You can place these values in a `.env` file when running locally (the app uses `python-dotenv`).
+```json
+{
+  "123abc-form-id": {
+    "email": "email",
+    "lifecyclestage": "lifecyclestage",
+    "custom_checkbox": "custom_checkbox_property"
+  },
+  "another-form": {
+    "email": "email",
+    "company": "company",
+    "job_title": "jobtitle"
+  }
+}
+```
+
+Place these values in a `.env` file for local development (the app loads it with `python-dotenv`).
 
 ---
 
@@ -45,96 +58,79 @@ You can place these values in a `.env` file when running locally (the app uses `
    pip install -r requirements.txt
    ```
 
-2. Export the required environment variables or create a `.env` file:
+2. Create a `.env` file or export the required environment variables:
 
    ```bash
    export HUBSPOT_PRIVATE_APP_TOKEN="your-private-app-token"
-   export HUBSPOT_FORM_ID="---"
+   export HUBSPOT_FORM_PROPERTY_MAP='{"form_id":{"email":"email"}}'
    ```
 
 3. Start the FastAPI app with Uvicorn:
 
    ```bash
-   uvicorn app:app --host 0.0.0.0 --port 8000
+   uvicorn main:app --host 0.0.0.0 --port 8000
    ```
 
-4. Trigger a run by sending a POST request to the `/run` endpoint. The body is optional, but you can override the batch size or
-   cap the total submissions processed if you need to throttle very large jobs:
+4. Trigger the worker by calling `/run-all`:
 
    ```bash
-   curl -X POST http://localhost:8000/run
-   # override the per-request batch size
-    curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"batch_size": 750}'
-   # or limit the total submissions processed
-   curl -X POST http://localhost:8000/run -H "Content-Type: application/json" -d '{"max_submissions": 2000}'
+   curl -X POST http://localhost:8000/run-all -H "Content-Type: application/json" -d '{"mode":"smoke"}'
+   curl -X POST http://localhost:8000/run-all -H "Content-Type: application/json" -d '{"mode":"write"}'
    ```
 
-A successful request returns a payload similar to:
+   Smoke mode logs the submissions and the contact IDs it found. Write mode repeats the smoke flow but also patches the mapped properties for each matching contact.
+
+5. Check `/health` to ensure the service is online and has read the form IDs:
+
+   ```bash
+   curl http://localhost:8000/health
+   ```
+
+---
+
+## API Endpoints
+
+### `POST /run-all`
+
+Body:
 
 ```json
 {
-  "processed": 42,
-  "updated": 35,
-  "skipped": 6,
-  "errors": 1
+  "mode": "smoke" | "write"
 }
 ```
 
+- `smoke` (default) fetches each configured form, prints a submission summary, and never calls the CRM update endpoint.
+- `write` performs the same iteration but patches only the mapped properties that are present in each submission.
+
+The endpoint returns `{ "status": "complete", "mode": "smoke" }` (or `write`) when the run finishes.
+
+### `GET /health`
+
+Returns `{ "status": "ok", "forms": ["form-id", ...] }`.
+
 ---
 
-## Deploying to Render
+## Deployment Notes
 
-1. Create a new **Web Service** in Render and point it at this repository.
-2. Choose a Python environment and set the start command to:
+1. Create a new web service in your preferred host (Render, Fly.io, etc.).
+2. Set the start command to:
 
    ```bash
-   uvicorn app:app --host 0.0.0.0 --port $PORT
+   uvicorn main:app --host 0.0.0.0 --port $PORT
    ```
 
-3. Add the required environment variables in the Render dashboard:
-   - `HUBSPOT_PRIVATE_APP_TOKEN`
-   - (Optional) `HUBSPOT_FORM_ID`
-   - (Optional) `HUBSPOT_BASE_URL`
-
-4. After deployment, trigger the automation by issuing a POST request to `https://<your-render-service>.onrender.com/run`.
-   You can call this endpoint from another system, a manual curl command, or any workflow tool that supports webhooks.
-
----
-
-## How the Service Works
-
-1. **Fetch submissions** – Calls `GET /form-integrations/v1/submissions/forms/{formId}` in batches (default 500 per request),
-   automatically paging through the results until the API reports no further data or the optional `max_submissions` threshold is
-   met.
-2. **Parse checkbox values** – Reads the `values` array from each submission and extracts:
-   - `---`
-   - `---` →
-     `---`
-3. **Find matching contact** – Uses the HubSpot CRM search endpoint to locate the contact by exact email.
-4. **Update contact** – Patches the contact with the parsed consent values. If the contact is missing or an error occurs, the
-   service records the skipped/error count but continues processing the remaining submissions.
-
-All processing happens synchronously within the request so you immediately receive a status summary. For large batches (for
-example 10,000+ submissions) the service paginates through the HubSpot results automatically. You can reduce the `batch_size` or
-set `max_submissions` to break the work into smaller chunks if you need to respect HubSpot rate limits or long-running timeouts.
-
----
-
-## Troubleshooting
-
-- HTTP 500 errors usually indicate missing configuration (e.g., token not set). Check the Render service logs or local console for
-  stack traces.
-- HTTP 502 responses typically originate from HubSpot API failures. Review the message returned in the JSON body or logs.
-- Ensure the HubSpot private app token has access to both **Forms** and **CRM** scopes.
+3. Add the required environment variables in the hosting dashboard.
+4. Trigger the job manually (curl, workflow automation, cron) whenever you need to re-sync the historic submissions.
 
 ---
 
 ## Repository Structure
 
 ```
-app.py             # FastAPI app entry point and HubSpot recovery logic
-requirements.txt  # Python dependencies for the web service
-README.md         # This documentation
+main.py          # FastAPI app entry point and HubSpot recovery logic
+requirements.txt # Python dependencies
+README.md        # Documentation for running and deploying the worker
 ```
 
-This setup allows you to run the recovery process on demand without relying on Zapier.
+This lightweight setup lets you replay multiple form submissions safely without relying on Zapier or other automation tools.
