@@ -1,260 +1,263 @@
-"""
-HubSpot Form Recovery – Multi-Form Edition
-------------------------------------------
-
-Modes:
-1) Smoke Test Mode (dry run):
-    → Reads submissions
-    → Finds contacts in HubSpot
-    → Prints a simple summary
-    → No HubSpot updates
-
-2) Write Mode:
-    → Same as smoke test
-    → PLUS updates only missing fields defined in HUBSPOT_FORM_PROPERTY_MAP
-"""
-
-from __future__ import annotations
-import json, logging, os, time
-from datetime import datetime
-from typing import Dict, List, Optional
+import os
+import json
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+from typing import Dict, Any, Optional
 
 import requests
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from logging.handlers import RotatingFileHandler
-
-# ---------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------
 
 load_dotenv()
-os.makedirs("data", exist_ok=True)
 
-LOG_FILE = os.getenv("LOG_FILE", "recovery.log")
-LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
-
-logger = logging.getLogger("hubspot_recovery")
-logger.setLevel(logging.INFO)
-logger.handlers = []
-for h in (logging.StreamHandler(), RotatingFileHandler(LOG_FILE, maxBytes=3_000_000, backupCount=3)):
-    h.setFormatter(logging.Formatter(LOG_FORMAT))
-    logger.addHandler(h)
-
-app = FastAPI(title="HubSpot Form Recovery")
+# ---------------------------------------------------------------------------
+# Environment Variables
+# ---------------------------------------------------------------------------
 
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
-HUBSPOT_BASE_URL = "https://api.hubapi.com"
+FORM_PROPERTY_MAP_RAW = os.getenv("HUBSPOT_FORM_PROPERTY_MAP")
+HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
+DRY_RUN_FORCE = os.getenv("DRY_RUN_FORCE", "false").lower() == "true"
 
-# MULTI-FORM MAP (in Render env)
-HUBSPOT_FORM_PROPERTY_MAP = json.loads(os.getenv("HUBSPOT_FORM_PROPERTY_MAP", "{}"))
+if not HUBSPOT_TOKEN:
+    raise Exception("HUBSPOT_PRIVATE_APP_TOKEN is required.")
+if not FORM_PROPERTY_MAP_RAW:
+    raise Exception("HUBSPOT_FORM_PROPERTY_MAP is required.")
 
-if not HUBSPOT_FORM_PROPERTY_MAP:
-    raise RuntimeError("Missing HUBSPOT_FORM_PROPERTY_MAP env var — cannot continue.")
+FORM_PROPERTY_MAP: Dict[str, Dict[str, str]] = json.loads(FORM_PROPERTY_MAP_RAW)
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Logging Setup — One-line JSON logs
+# ---------------------------------------------------------------------------
 
-def hubspot_headers() -> Dict[str, str]:
+logger = logging.getLogger("recovery")
+logger.setLevel(logging.INFO)
+
+handler = RotatingFileHandler("recovery.log", maxBytes=2_000_000, backupCount=3)
+formatter = logging.Formatter('%(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+def log_json(event: str, **kwargs):
+    record = {"event": event, **kwargs}
+    logger.info(json.dumps(record))
+
+
+# ---------------------------------------------------------------------------
+# HubSpot API Helpers
+# ---------------------------------------------------------------------------
+
+def hubspot_headers():
     return {
         "Authorization": f"Bearer {HUBSPOT_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
-def find_contact_by_email(email: str) -> Optional[str]:
-    """Search HubSpot contact by email."""
-    payload = {
-        "filterGroups": [{
-            "filters": [{
-                "propertyName": "email",
-                "operator": "EQ",
-                "value": email
-            }]
-        }],
-        "limit": 1,
+
+# Fetch form submissions w/ pagination
+def fetch_form_submissions(form_id: str, after: Optional[str] = None):
+    url = f"{HUBSPOT_BASE_URL}/marketing/v3/forms/{form_id}/submissions"
+    params = {"limit": 100}
+    if after:
+        params["after"] = after
+
+    resp = requests.get(url, headers=hubspot_headers(), params=params)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_contact_by_email(email: str) -> Optional[Dict[str, Any]]:
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search"
+    body = {
+        "filterGroups": [
+            {"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}
+        ],
         "properties": ["email"],
+        "limit": 1
     }
 
-    r = requests.post(
-        f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search",
-        headers=hubspot_headers(),
-        json=payload,
-        timeout=30,
+    resp = requests.post(url, headers=hubspot_headers(), json=body)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "results" in data and len(data["results"]) > 0:
+        return data["results"][0]
+
+    return None
+
+
+def update_contact(contact_id: str, properties: Dict[str, Any]):
+    url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{contact_id}"
+    resp = requests.patch(url, headers=hubspot_headers(), json={"properties": properties})
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Rate Limit Heuristics
+# ---------------------------------------------------------------------------
+
+def apply_rate_limit_heuristics(resp_headers):
+    """
+    Uses HubSpot response headers to throttle calls safely.
+
+    Uses the 4 heuristic rules you approved:
+    1. If remaining under 10 → sleep 2 seconds
+    2. If remaining under 5  → sleep 4 seconds
+    3. If "too many requests" → sleep 10 seconds
+    4. Add a tiny jitter (0.1–0.3s) for smoothing burst patterns
+    """
+
+    remaining = resp_headers.get("X-HubSpot-RateLimit-Remaining")
+    if remaining is not None:
+        try:
+            remaining = int(remaining)
+            if remaining < 5:
+                time.sleep(4)
+            elif remaining < 10:
+                time.sleep(2)
+        except:
+            pass
+
+    if resp_headers.get("Retry-After"):
+        time.sleep(int(resp_headers["Retry-After"]))
+
+    time.sleep(0.15)  # jitter
+
+
+# ---------------------------------------------------------------------------
+# Process One Submission (core logic)
+# ---------------------------------------------------------------------------
+
+def process_submission(
+    form_id: str,
+    submission: Dict[str, Any],
+    mode: str
+):
+    submitted_values = submission.get("values", [])
+
+    # Extract email from submission
+    email = None
+    submission_fields = {}
+
+    for field in submitted_values:
+        field_name = field.get("name")
+        field_value = field.get("value")
+        submission_fields[field_name] = field_value
+        if field_name == "email":
+            email = field_value
+
+    # EMAIL REQUIRED
+    if not email:
+        log_json("skip_no_email", form=form_id, submissionId=submission.get("submittedAt"))
+        return
+
+    # Find contact once
+    contact = get_contact_by_email(email)
+    if not contact:
+        log_json("contact_not_found", form=form_id, email=email)
+        return
+
+    contact_id = contact["id"]
+
+    # Start building changes
+    mapped_fields = FORM_PROPERTY_MAP.get(form_id, {})
+    updates = {}
+
+    # Loop mapped fields ONLY
+    for form_field, hubspot_property in mapped_fields.items():
+        submission_value = submission_fields.get(form_field)
+
+        # Per-field rule 1: Must be in submission
+        if submission_value is None:
+            continue
+
+        # Per-field rule 2: Must be mapped (guaranteed)
+        # Per-field rule 3: Don't overwrite existing values
+        existing_value = contact.get("properties", {}).get(hubspot_property)
+        if existing_value not in (None, "", " "):
+            continue
+
+        updates[hubspot_property] = submission_value
+
+    # Emit summary log
+    log_json(
+        "submission_processed",
+        form=form_id,
+        email=email,
+        contact_id=contact_id,
+        updates_count=len(updates),
+        updates=updates,
+        mode=mode
     )
 
-    if not r.ok:
-        logger.error(f"Search failed for {email}: {r.text}")
-        return None
+    # Dry-Run Override (env-level)
+    if DRY_RUN_FORCE:
+        log_json("dry_run_forced", form=form_id, email=email)
+        return
 
-    results = r.json().get("results", [])
-    return results[0]["id"] if results else None
-
-
-def fetch_form_submissions(form_id: str) -> List[Dict]:
-    """Fetch ALL submissions for a given form ID."""
-    logger.info(f"Fetching submissions for form: {form_id}")
-
-    after = None
-    results = []
-    total = 0
-
-    while True:
-        params = {"limit": 50}
-        if after:
-            params["after"] = after
-
-        r = requests.get(
-            f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}",
-            headers={"Authorization": f"Bearer {HUBSPOT_TOKEN}"},
-            params=params,
-            timeout=30,
-        )
-
-        if not r.ok:
-            logger.error(f"Failed to fetch form {form_id}: {r.text}")
-            break
-
-        data = r.json()
-        batch = data.get("results", [])
-        if not batch:
-            break
-
-        results.extend(batch)
-        total += len(batch)
-
-        after = data.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
-
-        time.sleep(0.3)
-
-    logger.info(f"Fetched {total} submissions for form {form_id}")
-    return results
+    if mode == "write" and updates:
+        update_contact(contact_id, updates)
 
 
-def extract_submission_values(sub: Dict) -> Dict[str, str]:
-    """Turns HubSpot's weird structure into a simple dict."""
-    flat = {}
-    for item in sub.get("values", []):
-        name = item.get("name")
-        value = item.get("value")
-        if isinstance(name, str):
-            flat[name] = value
-    return flat
+# ---------------------------------------------------------------------------
+# Worker Runner
+# ---------------------------------------------------------------------------
+
+def run_recovery(mode: str):
+    if DRY_RUN_FORCE:
+        mode = "smoke"
+
+    for form_id in FORM_PROPERTY_MAP.keys():
+        log_json("start_form", form=form_id, mode=mode)
+
+        after = None
+
+        while True:
+            resp = requests.get(
+                f"{HUBSPOT_BASE_URL}/marketing/v3/forms/{form_id}/submissions",
+                headers=hubspot_headers(),
+                params={"limit": 100, **({"after": after} if after else {})}
+            )
+            resp.raise_for_status()
+
+            data = resp.json()
+            results = data.get("results", [])
+
+            apply_rate_limit_heuristics(resp.headers)
+
+            for submission in results:
+                process_submission(form_id, submission, mode)
+
+            page = data.get("paging", {})
+            if not page or "next" not in page:
+                break
+
+            after = page["next"]["after"]
+
+        log_json("end_form", form=form_id)
 
 
-# ---------------------------------------------------------------------
-# Smoke Test & Write Logic
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------------------------------
 
-def run_smoke_test(form_id: str, mapping: Dict[str, str], submissions: List[Dict]):
-    """Print a clean, simple summary with NO writes."""
-    logger.info(f"--- Smoke Test for Form {form_id} ({len(submissions)} submissions) ---")
-
-    for idx, sub in enumerate(submissions, start=1):
-        vals = extract_submission_values(sub)
-
-        email = vals.get("email", "").strip()
-        cid = find_contact_by_email(email) if email else None
-
-        logger.info(f"[SMOKE] {form_id} | #{idx}")
-        logger.info(f"   email: {email or 'MISSING'}")
-        logger.info(f"   contact_id: {cid or 'NOT FOUND'}")
-
-        # Show only mapped fields present
-        mapped_found = {k: vals.get(k) for k in mapping.keys() if k in vals}
-        logger.info(f"   fields: {json.dumps(mapped_found, indent=4)}")
-
-
-def run_write_mode(form_id: str, mapping: Dict[str, str], submissions: List[Dict]):
-    """Updates ONLY the fields defined in the map and present in the submission."""
-    logger.info(f"--- Write Mode for Form {form_id} ({len(submissions)} submissions) ---")
-
-    for idx, sub in enumerate(submissions, start=1):
-        vals = extract_submission_values(sub)
-        email = vals.get("email", "").strip()
-        if not email:
-            continue
-
-        cid = find_contact_by_email(email)
-        if not cid:
-            logger.info(f"[WRITE] #{idx} email={email} → Contact NOT FOUND")
-            continue
-
-        # Build only properties that appear in this submission
-        props_to_update = {
-            hs_prop: vals.get(form_field)
-            for form_field, hs_prop in mapping.items()
-            if form_field in vals
-        }
-
-        if not props_to_update:
-            logger.info(f"[WRITE] #{idx} email={email} → No mapped fields in submission")
-            continue
-
-        payload = {"properties": props_to_update}
-
-        r = requests.patch(
-            f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/{cid}",
-            headers=hubspot_headers(),
-            json=payload,
-            timeout=30,
-        )
-
-        if r.ok:
-            logger.info(f"[WRITE] Updated {email} → {json.dumps(props_to_update)}")
-        else:
-            logger.error(f"[WRITE] FAILED {email}: {r.text}")
-
-        time.sleep(0.3)
-
-
-# ---------------------------------------------------------------------
-# Main Endpoint
-# ---------------------------------------------------------------------
-
-@app.post("/run-all")
-async def run_all(request: Request):
-    """
-    Body:
-    {
-        "mode": "smoke" | "write"
-    }
-    """
-    try:
-        body = await request.json()
-    except:
-        body = {}
-
-    mode = body.get("mode", "smoke").lower()
-
-    if mode not in ("smoke", "write"):
-        return {"error": "mode must be 'smoke' or 'write'"}
-
-    logger.info(f"▶️ Starting run-all in mode={mode}")
-
-    # Iterate form → mapping → submissions
-    for form_id, mapping in HUBSPOT_FORM_PROPERTY_MAP.items():
-        submissions = fetch_form_submissions(form_id)
-
-        if mode == "smoke":
-            run_smoke_test(form_id, mapping, submissions)
-        else:
-            run_write_mode(form_id, mapping, submissions)
-
-    return {"status": "complete", "mode": mode}
+app = FastAPI()
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "forms": list(HUBSPOT_FORM_PROPERTY_MAP.keys())}
+    return {"status": "ok", "forms": list(FORM_PROPERTY_MAP.keys())}
 
 
-# ---------------------------------------------------------------------
-# Local run
-# ---------------------------------------------------------------------
+@app.post("/run-all")
+def run_all(body: Dict[str, Any] = Body(...)):
+    mode = body.get("mode", "smoke")
+    if mode not in ("smoke", "write"):
+        return JSONResponse(status_code=400, content={"error": "Invalid mode"})
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    run_recovery(mode)
+    return {"status": "complete", "mode": mode}
