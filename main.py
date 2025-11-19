@@ -2,8 +2,7 @@ import os
 import json
 import time
 import logging
-from logging.handlers import RotatingFileHandler
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 from fastapi import FastAPI, Body, Header, HTTPException, Depends
@@ -16,7 +15,7 @@ load_dotenv()
 # App Metadata
 # ---------------------------------------------------------------------------
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.4.0"
 
 # ---------------------------------------------------------------------------
 # Environment Variables
@@ -146,7 +145,6 @@ def fetch_form_submissions(
     """
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
 
-    # Hard-coded API page size to 50 (HubSpot max)
     hubspot_limit = 50
     params: Dict[str, Any] = {"limit": hubspot_limit}
     if after:
@@ -200,6 +198,41 @@ def fetch_form_submissions(
     return {"results": results, "after": next_after}
 
 
+def fetch_all_form_submissions(
+    form_id: str,
+    start_after: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch ALL submissions for a form (newest → oldest across pages).
+    Used for full repair runs where we need the whole history to dedupe.
+    """
+    submissions: List[Dict[str, Any]] = []
+    after = start_after
+
+    while True:
+        page = fetch_form_submissions(form_id, after=after)
+        results = page.get("results", [])
+        next_after = page.get("after")
+
+        if not results:
+            break
+
+        submissions.extend(results)
+
+        if not next_after:
+            break
+
+        after = next_after
+
+    log_json(
+        "form_fetch_complete",
+        form=form_id,
+        total_submissions=len(submissions),
+        start_after=start_after,
+    )
+    return submissions
+
+
 def get_contact_by_email(email: str) -> Optional[Dict[str, Any]]:
     url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search"
     body = {
@@ -235,7 +268,7 @@ def update_contact(contact_id: str, properties: Dict[str, Any]) -> Dict[str, Any
 
 def extract_submission_email_and_fields(
     submission: Dict[str, Any]
-) -> (Optional[str], Dict[str, Any]):
+) -> Tuple[Optional[str], Dict[str, Any]]:
     submitted_values = submission.get("values", [])
     email = None
     submission_fields: Dict[str, Any] = {}
@@ -256,19 +289,24 @@ def compute_updates_for_submission(
     submission_fields: Dict[str, Any],
     contact: Dict[str, Any]
 ) -> Dict[str, Any]:
-    contact_id = contact["id"]
+    """
+    Compute which HubSpot contact properties should be updated for this submission,
+    based on FORM_PROPERTY_MAP[form_id], but ONLY where the contact property is empty.
+    """
     existing_props = contact.get("properties", {}) or {}
-
     map_for_form = FORM_PROPERTY_MAP.get(form_id, {})
     updates: Dict[str, Any] = {}
 
     for form_field, hubspot_prop in map_for_form.items():
         val = submission_fields.get(form_field)
         if val is None:
-            continue
+            continue  # nothing submitted for that field
+
         existing_val = existing_props.get(hubspot_prop)
+        # If contact already has a value, we leave it alone
         if existing_val not in (None, "", " "):
             continue
+
         updates[hubspot_prop] = val
 
     return updates
@@ -280,6 +318,10 @@ def compute_updates_for_submission(
 
 
 def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> None:
+    """
+    Given a single submission, find the contact by email and apply missing-field updates
+    according to FORM_PROPERTY_MAP for that form.
+    """
     email, submission_fields = extract_submission_email_and_fields(submission)
 
     if not email:
@@ -325,31 +367,35 @@ def process_submission(form_id: str, submission: Dict[str, Any], mode: str) -> N
 
 
 def run_recovery(mode: str) -> None:
-    """Iterate through all configured forms and repair contact data."""
+    """
+    Iterate through all configured forms and repair contact data.
+    Uses the same core logic as /run-form/{form_id} (full dedupe mode).
+    """
     effective_mode = "smoke" if DRY_RUN_FORCE else mode
 
     for form_id in FORM_PROPERTY_MAP.keys():
-        log_json("start_form", form=form_id, requested_mode=mode, mode=effective_mode)
+        log_json(
+            "start_form",
+            form=form_id,
+            requested_mode=mode,
+            mode=effective_mode,
+        )
 
-        after = None
+        summary = run_recovery_for_form(
+            form_id=form_id,
+            mode=mode,
+            limit=None,
+            start_after=None,
+            filter_email=None,
+        )
 
-        while True:
-            page = fetch_form_submissions(form_id, after)
-            results = page.get("results", [])
-            next_after = page.get("after")
-
-            if not results:
-                break
-
-            for submission in results:
-                process_submission(form_id, submission, effective_mode)
-
-            if not next_after:
-                break
-
-            after = next_after
-
-        log_json("end_form", form=form_id, mode=effective_mode)
+        log_json(
+            "end_form",
+            form=form_id,
+            mode=effective_mode,
+            processed_count=summary.get("processed_count"),
+            matches_count=summary.get("matches_count"),
+        )
 
 
 def run_recovery_for_form(
@@ -360,15 +406,21 @@ def run_recovery_for_form(
     filter_email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Core runner for a single form with optional limit, paging, and email filter.
-    Returns summary info including last 'after' token for chaining.
+    Core runner for a single form.
+
+    Two modes:
+    - Email-specific (filter_email provided):
+        * Fetch ONLY the latest page of submissions
+        * Find the first (latest) matching submission
+        * Process it and STOP
+
+    - Full repair (no filter_email):
+        * Fetch ALL submissions (all pages)
+        * Deduplicate by email (keep the latest per email)
+        * Optionally respect 'limit' on number of unique emails to process
+        * Process each deduped submission once
     """
     effective_mode = "smoke" if DRY_RUN_FORCE else mode
-    processed_count = 0
-    matches_count = 0
-
-    after = start_after
-    last_after = None
 
     log_json(
         "run_single_form_start",
@@ -380,57 +432,118 @@ def run_recovery_for_form(
         filter_email=filter_email,
     )
 
-    while True:
-        page = fetch_form_submissions(form_id, after)
-        results = page.get("results", [])
-        next_after = page.get("after")
+    # -----------------------------------------------------------------------
+    # Branch 1: Email-specific test mode (latest-only)
+    # -----------------------------------------------------------------------
+    if filter_email:
+        processed_count = 0
+        matches_count = 0
 
-        if not results:
-            break
+        # Only fetch the latest page (newest submissions)
+        page = fetch_form_submissions(form_id, after=None)
+        results = page.get("results", [])
 
         for submission in results:
             processed_count += 1
 
             email, _ = extract_submission_email_and_fields(submission)
-            if filter_email:
-                if not email or email.lower() != filter_email.lower():
-                    continue
-                matches_count += 1
+            if not email:
+                continue
 
+            if email.lower() != filter_email.lower():
+                continue
+
+            # First time we see this email on the latest page → treat as latest
+            matches_count += 1
             process_submission(form_id, submission, effective_mode)
 
-            if limit is not None and processed_count >= limit:
-                last_after = next_after
-                log_json(
-                    "run_single_form_limit_reached",
-                    form=form_id,
-                    processed_count=processed_count,
-                    limit=limit,
-                    next_after=next_after,
-                )
-                log_json(
-                    "run_single_form_complete",
-                    form=form_id,
-                    mode=effective_mode,
-                    processed_count=processed_count,
-                    matches_count=matches_count,
-                    last_after=last_after,
-                )
-                return {
-                    "status": "complete",
-                    "form": form_id,
-                    "mode": effective_mode,
-                    "processed_count": processed_count,
-                    "matches_count": matches_count,
-                    "next_after": last_after,
-                }
+            log_json(
+                "run_single_form_latest_match",
+                form=form_id,
+                email=email,
+                processed_count=processed_count,
+                matches_count=matches_count,
+            )
 
-        if not next_after:
-            last_after = None
-            break
+            log_json(
+                "run_single_form_complete",
+                form=form_id,
+                mode=effective_mode,
+                processed_count=processed_count,
+                matches_count=matches_count,
+                last_after=None,
+            )
+            return {
+                "status": "complete",
+                "form": form_id,
+                "mode": effective_mode,
+                "processed_count": processed_count,
+                "matches_count": matches_count,
+                "next_after": None,
+                "note": "Stopped after latest matching submission on newest page.",
+            }
 
-        after = next_after
-        last_after = next_after
+        # No match on latest page
+        log_json(
+            "run_single_form_no_match",
+            form=form_id,
+            filter_email=filter_email,
+            processed_count=processed_count,
+            matches_count=matches_count,
+        )
+        log_json(
+            "run_single_form_complete",
+            form=form_id,
+            mode=effective_mode,
+            processed_count=processed_count,
+            matches_count=matches_count,
+            last_after=None,
+        )
+        return {
+            "status": "complete",
+            "form": form_id,
+            "mode": effective_mode,
+            "processed_count": processed_count,
+            "matches_count": matches_count,
+            "next_after": None,
+            "note": "No matching email found on newest page.",
+        }
+
+    # -----------------------------------------------------------------------
+    # Branch 2: Full repair mode (dedupe by latest submission per email)
+    # -----------------------------------------------------------------------
+    all_submissions = fetch_all_form_submissions(form_id, start_after=start_after)
+    processed_count = len(all_submissions)
+
+    # Deduplicate by email, keeping the first (latest) submission we see
+    deduped_by_email: Dict[str, Dict[str, Any]] = {}
+    for submission in all_submissions:
+        email, _ = extract_submission_email_and_fields(submission)
+        if not email:
+            continue
+        key = email.lower()
+        # Because all_submissions is newest → oldest, first occurrence is latest
+        if key not in deduped_by_email:
+            deduped_by_email[key] = submission
+
+    deduped_submissions: List[Dict[str, Any]] = list(deduped_by_email.values())
+    total_unique_emails = len(deduped_submissions)
+
+    log_json(
+        "dedupe_complete",
+        form=form_id,
+        total_submissions=processed_count,
+        unique_emails=total_unique_emails,
+    )
+
+    # Respect limit if provided (cap number of unique emails to process)
+    if limit is not None and limit >= 0:
+        deduped_submissions = deduped_submissions[:limit]
+
+    matches_count = len(deduped_submissions)
+
+    for submission in deduped_submissions:
+        process_submission(form_id, submission, effective_mode)
 
     log_json(
         "run_single_form_complete",
@@ -438,7 +551,7 @@ def run_recovery_for_form(
         mode=effective_mode,
         processed_count=processed_count,
         matches_count=matches_count,
-        last_after=last_after,
+        last_after=None,
     )
 
     return {
@@ -447,7 +560,8 @@ def run_recovery_for_form(
         "mode": effective_mode,
         "processed_count": processed_count,
         "matches_count": matches_count,
-        "next_after": last_after,
+        "next_after": None,
+        "unique_emails": total_unique_emails,
     }
 
 
@@ -459,6 +573,9 @@ def preview_recovery_for_form(
     """
     Preview mode: returns a list of potential updates without writing anything.
     Ignores DRY_RUN_FORCE and always behaves as a read-only dry-run.
+
+    NOTE: This does NOT dedupe; it shows raw candidate updates per submission,
+    which is often helpful for inspection.
     """
     processed_count = 0
     preview_items: List[Dict[str, Any]] = []
@@ -674,7 +791,7 @@ def run_form_for_email(
 ):
     """
     Run recovery for a single contact (by email) within a form.
-    Respects DRY_RUN_FORCE.
+    Uses latest-only logic on the newest page and respects DRY_RUN_FORCE.
     """
     if KILLED:
         log_json("run_blocked_killed", form=form_id, email=email)
@@ -697,7 +814,6 @@ def run_form_for_email(
             content={"error": "Invalid mode. Use 'smoke' or 'write'."},
         )
 
-    # We don't apply 'limit' here; we process all submissions for this email.
     summary = run_recovery_for_form(
         form_id=form_id,
         mode=mode,
@@ -750,8 +866,11 @@ def run_form_batch(
     _: bool = Depends(require_auth),
 ):
     """
-    Run a batch for a single form starting from a specific 'after' token.
-    Useful for manual paging through very large historical datasets.
+    Batch run for a single form.
+
+    In the new model, this behaves like a full-form run with optional 'limit'
+    on number of unique emails processed. 'start_after' is accepted but the
+    core full-repair mode always pulls the complete set to dedupe correctly.
     """
     if KILLED:
         log_json("run_blocked_killed", form=form_id)
