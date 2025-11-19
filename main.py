@@ -41,14 +41,13 @@ FORM_PROPERTY_MAP: Dict[str, Dict[str, str]] = json.loads(FORM_PROPERTY_MAP_RAW)
 # Logging Setup — One-line JSON logs
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger("recovery")
-logger.setLevel(logging.INFO)
-
-handler = RotatingFileHandler("recovery.log", maxBytes=2_000_000, backupCount=3)
+# Replace file handler with stdout logging
+handler = logging.StreamHandler()
 formatter = logging.Formatter("%(message)s")
 handler.setFormatter(formatter)
-logger.addHandler(handler)
 
+# Ensure no duplicate handlers
+logger.handlers = [handler]
 
 def log_json(event: str, **kwargs) -> None:
     record = {"event": event, **kwargs}
