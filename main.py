@@ -16,7 +16,7 @@ load_dotenv()
 # App Metadata
 # ---------------------------------------------------------------------------
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 
 # ---------------------------------------------------------------------------
 # Environment Variables
@@ -44,11 +44,12 @@ FORM_PROPERTY_MAP: Dict[str, Dict[str, str]] = json.loads(FORM_PROPERTY_MAP_RAW)
 logger = logging.getLogger("recovery")
 logger.setLevel(logging.INFO)
 
-handler = logging.StreamHandler()             # <-- send logs to Render stdout
+handler = logging.StreamHandler()             # send logs to stdout
 formatter = logging.Formatter("%(message)s")  # one-line JSON logs
 handler.setFormatter(formatter)
 
 logger.handlers = [handler]  # ensure no duplicate handlers
+
 
 def log_json(event: str, **kwargs) -> None:
     record = {"event": event, **kwargs}
@@ -132,15 +133,22 @@ def apply_rate_limit_heuristics(resp_headers: Dict[str, Any]) -> None:
     time.sleep(0.15)
 
 
-def fetch_form_submissions(form_id: str, after: Optional[str] = None,
-                           limit: int = 1000) -> Dict[str, Any]:
+def fetch_form_submissions(
+    form_id: str,
+    after: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
     """
     Fetch submissions using the form-integrations API.
-    HubSpot returns inconsistent paging formats, so we normalize it.
+
+    NOTE: HubSpot's max limit for this endpoint is 50.
+    We hard-code limit=50 to avoid 400 Bad Request responses.
     """
     url = f"{HUBSPOT_BASE_URL}/form-integrations/v1/submissions/forms/{form_id}"
 
-    params: Dict[str, Any] = {"limit": limit}
+    # Hard-coded API page size to 50 (HubSpot max)
+    hubspot_limit = 50
+    params: Dict[str, Any] = {"limit": hubspot_limit}
     if after:
         params["after"] = after
 
@@ -166,7 +174,7 @@ def fetch_form_submissions(form_id: str, after: Optional[str] = None,
     data = resp.json()
     results = data.get("results", [])
 
-    # Normalize after token across all HubSpot weird formats
+    # Normalize after token across all HubSpot paging formats
     next_after = None
 
     # structure #1 { "paging": { "next": { "after": "abc" } } }
