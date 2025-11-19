@@ -38,16 +38,17 @@ if not APP_AUTH_TOKEN:
 FORM_PROPERTY_MAP: Dict[str, Dict[str, str]] = json.loads(FORM_PROPERTY_MAP_RAW)
 
 # ---------------------------------------------------------------------------
-# Logging Setup — One-line JSON logs
+# Logging Setup — One-line JSON logs (stdout for Render)
 # ---------------------------------------------------------------------------
 
-# Replace file handler with stdout logging
-handler = logging.StreamHandler()
-formatter = logging.Formatter("%(message)s")
+logger = logging.getLogger("recovery")
+logger.setLevel(logging.INFO)
+
+handler = logging.StreamHandler()             # <-- send logs to Render stdout
+formatter = logging.Formatter("%(message)s")  # one-line JSON logs
 handler.setFormatter(formatter)
 
-# Ensure no duplicate handlers
-logger.handlers = [handler]
+logger.handlers = [handler]  # ensure no duplicate handlers
 
 def log_json(event: str, **kwargs) -> None:
     record = {"event": event, **kwargs}
